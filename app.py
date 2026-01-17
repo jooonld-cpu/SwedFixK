@@ -14,70 +14,55 @@ from threading import Thread
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_NAME = os.getenv("SHEET_NAME", "SwedenFINK")
 GCP_JSON_DATA = os.getenv("GCP_JSON")
-
-# Список ID администраторов (получают заявки на вывод)
 ADMIN_LIST = [7631664265, 6343896085]
 
-# Создаем файл ключей
 if GCP_JSON_DATA:
-    try:
-        with open("credentials.json", "w") as f:
-            f.write(GCP_JSON_DATA)
-        print("✅ Файл credentials.json создан", flush=True)
-    except Exception as e:
-        print(f"❌ Ошибка записи JSON: {e}", flush=True)
+    with open("credentials.json", "w") as f:
+        f.write(GCP_JSON_DATA)
 
 # --- 2. ПОДКЛЮЧЕНИЕ К ТАБЛИЦАМ ---
-try:
-    print(f"📡 Подключение к Google Таблице: {SHEET_NAME}...", flush=True)
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    gc = gspread.authorize(creds)
-    main_doc = gc.open(SHEET_NAME)
-    sheet = main_doc.sheet1
-    
-    # Пытаемся найти или создать лист истории
+def get_sheets():
     try:
-        history_sheet = main_doc.worksheet("История")
-    except:
-        history_sheet = main_doc.add_worksheet(title="История", rows="1000", cols="5")
-        history_sheet.append_row(["Дата", "Ник", "Админ", "Сумма"])
-        
-    print("✅ Таблицы успешно подключены!", flush=True)
-except Exception as e:
-    print(f"❌ ОШИБКА ТАБЛИЦ: {e}", flush=True)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        gc = gspread.authorize(creds)
+        doc = gc.open(SHEET_NAME)
+        # Проверка наличия листа История
+        wks_list = [w.title for w in doc.worksheets()]
+        h_sheet = doc.worksheet("История") if "История" in wks_list else None
+        return doc.sheet1, h_sheet
+    except Exception as e:
+        print(f"Ошибка Google: {e}")
+        return None, None
 
+sheet, history_sheet = get_sheets()
 bot = telebot.TeleBot(BOT_TOKEN)
 u_data = {}
 
 # --- 3. ФУНКЦИИ ---
 def gen_id():
-    """Генерирует уникальный 12-значный ID"""
     while True:
-        new_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(12))
-        if not sheet.find(new_id, in_column=1):
-            return new_id
+        nid = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(12))
+        try:
+            if not sheet.find(nid, in_column=1): return nid
+        except: return nid
 
-# --- 4. ОБРАБОТЧИКИ ---
+# --- 4. ОБРАБОТЧИКИ (МЕНЮ) ---
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    print(f"➡️ Пользователь {message.from_user.id} нажал /start", flush=True)
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("📝 Регистрация", "💰 Баланс", "📉 Снять монеты")
-    bot.send_message(message.chat.id, "👋 Добро пожаловать! Выберите действие на клавиатуре:", reply_markup=markup)
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📝 Регистрация", "👤 Мой профиль")
+    bot.send_message(message.chat.id, "👋 Добро пожаловать в SwedenFINK!\nИспользуйте меню для работы с балансом:", reply_markup=markup)
 
-# --- РЕГИСТРАЦИЯ ---
 @bot.message_handler(func=lambda m: m.text == "📝 Регистрация")
 def reg(m):
-    print(f"➡️ Нажата Регистрация ({m.from_user.id})", flush=True)
     try:
         if sheet.find(str(m.from_user.id), in_column=2):
-            return bot.send_message(m.chat.id, "❌ Вы уже зарегистрированы в системе!")
-        msg = bot.send_message(m.chat.id, "Введите ваш Ник (имя в игре):")
+            return bot.send_message(m.chat.id, "❌ Вы уже зарегистрированы!")
+        msg = bot.send_message(m.chat.id, "Введите ваш игровой Ник:")
         bot.register_next_step_handler(msg, get_nick)
-    except Exception as e:
-        print(f"❌ Ошибка в reg: {e}", flush=True)
+    except: bot.send_message(m.chat.id, "⚠️ Ошибка связи с таблицей.")
 
 def get_nick(m):
     u_data[m.from_user.id] = {'n': m.text}
@@ -86,125 +71,109 @@ def get_nick(m):
 
 def get_job(m):
     uid = m.from_user.id
-    if uid not in u_data: return
     try:
         pwd = gen_id()
-        # Столбцы: ID(1), TG_ID(2), Nick(3), Balance(4), Job(5)
         sheet.append_row([pwd, str(uid), u_data[uid]['n'], "0", m.text])
-        bot.send_message(m.chat.id, f"✅ Регистрация завершена!\n🔑 Ваш личный ID: `{pwd}`\n\nНикому не сообщайте этот код!", parse_mode="Markdown")
-        print(f"✅ Новый пользователь: {u_data[uid]['n']}", flush=True)
-    except Exception as e:
-        bot.send_message(m.chat.id, "❌ Ошибка при записи в таблицу.")
-        print(f"❌ Ошибка в get_job: {e}", flush=True)
+        bot.send_message(m.chat.id, f"✅ Регистрация успешна!\n🔑 Ваш личный ID: `{pwd}`\n(Он пригодится для проверки через других ботов)")
+    except Exception as e: bot.send_message(m.chat.id, f"❌ Ошибка: {e}")
 
-# --- БАЛАНС ---
-@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
-def ask_bal(m):
-    msg = bot.send_message(m.chat.id, "🔐 Введите ваш 12-значный ID для проверки баланса:")
-    bot.register_next_step_handler(msg, show_bal)
-
-def show_bal(m):
-    try:
-        user_code = m.text.strip()
-        cell = sheet.find(user_code, in_column=1)
-        if cell:
-            row = sheet.row_values(cell.row)
-            bot.send_message(m.chat.id, f"👤 Игрок: {row[2]}\n💰 Баланс: {row[3]} Gold")
-        else:
-            bot.send_message(m.chat.id, "❌ Код не найден. Проверьте правильность ввода.")
-    except Exception as e:
-        bot.send_message(m.chat.id, "⚠️ Ошибка при поиске.")
-        print(f"❌ Ошибка в show_bal: {e}", flush=True)
-
-# --- ВЫВОД СРЕДСТВ ---
-@bot.message_handler(func=lambda m: m.text == "📉 Снять монеты")
-def with_start(m):
-    print(f"➡️ Нажато Снятие ({m.from_user.id})", flush=True)
+# --- МЕНЮ ПРОФИЛЯ ---
+@bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
+def show_profile(m):
     try:
         cell = sheet.find(str(m.from_user.id), in_column=2)
         if not cell:
-            return bot.send_message(m.chat.id, "❌ Вы не зарегистрированы. Сначала пройдите регистрацию.")
+            return bot.send_message(m.chat.id, "❌ Вы не зарегистрированы. Нажмите '📝 Регистрация'.")
         
-        msg = bot.send_message(m.chat.id, "Сколько Gold вы хотите снять?")
-        bot.register_next_step_handler(msg, proc_with)
+        row = sheet.row_values(cell.row)
+        # Структура: ID(0), TG_ID(1), Nick(2), Bal(3), Job(4)
+        text = (f"👤 **Профиль: {row[2]}**\n"
+                f"💼 Должность: {row[4]}\n"
+                f"💰 Баланс: **{row[3]} Gold**\n"
+                f"🆔 Ваш код: `{row[0]}`")
+        
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.row(telebot.types.InlineKeyboardButton("📉 Снять Gold", callback_data="pre_withdraw"))
+        kb.row(telebot.types.InlineKeyboardButton("🔄 Обновить", callback_data="refresh_profile"))
+        
+        bot.send_message(m.chat.id, text, parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
-        print(f"❌ Ошибка в with_start: {e}", flush=True)
+        bot.send_message(m.chat.id, "⚠️ Не удалось загрузить профиль.")
+        print(f"Error Profile: {e}")
 
-def proc_with(m):
+# --- ОБРАБОТКА ИНЛАЙН КНОПОК ---
+@bot.callback_query_handler(func=lambda c: True)
+def handle_callback(c):
+    # Кнопка снятия в профиле
+    if c.data == "pre_withdraw":
+        msg = bot.send_message(c.message.chat.id, "Введите сумму Gold, которую хотите снять:")
+        bot.register_next_step_handler(msg, process_withdraw_request)
+        bot.answer_callback_query(c.id)
+
+    # Кнопка обновить в профиле
+    elif c.data == "refresh_profile":
+        bot.delete_message(c.message.chat.id, c.message.message_id)
+        show_profile(c.message)
+        bot.answer_callback_query(c.id, "Обновлено")
+
+    # Кнопки для админов (Одобрить/Отклонить)
+    elif c.data.startswith("adm_ok_"):
+        _, _, r_idx, amt = c.data.split("_")
+        execute_payout(c, int(r_idx), float(amt))
+
+    elif c.data == "adm_no":
+        bot.edit_message_text("❌ Заявка отклонена администратором.", c.message.chat.id, c.message.message_id)
+        bot.answer_callback_query(c.id)
+
+def process_withdraw_request(m):
     try:
-        # Валидация числа
-        amount_txt = m.text.replace(',', '.')
-        if not amount_txt.replace('.', '', 1).isdigit():
-            return bot.send_message(m.chat.id, "❌ Введите только число (например: 100 или 50.5)")
-        
-        amt = float(amount_txt)
+        amt = float(m.text.replace(',', '.'))
         cell = sheet.find(str(m.from_user.id), in_column=2)
         row = sheet.row_values(cell.row)
+        bal = float(str(row[3]).replace(',', '.'))
         
-        # Проверка баланса (4-й столбец)
-        balance = float(str(row[3]).replace(',', '.'))
-        
-        if balance < amt:
-            return bot.send_message(m.chat.id, f"❌ Недостаточно средств. Ваш баланс: {balance} Gold")
+        if bal < amt:
+            return bot.send_message(m.chat.id, f"❌ Недостаточно средств. Баланс: {bal} Gold")
 
-        # Кнопки для админов
+        # Отправка админам
         kb = telebot.types.InlineKeyboardMarkup()
-        kb.add(
-            telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"ok_{cell.row}_{amt}"),
-            telebot.types.InlineKeyboardButton("❌ Отказать", callback_data="no")
-        )
+        kb.add(telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adm_ok_{cell.row}_{amt}"),
+               telebot.types.InlineKeyboardButton("❌ Отказать", callback_data="adm_no"))
         
         for adm in ADMIN_LIST:
-            try:
-                bot.send_message(adm, f"🚨 ЗАЯВКА НА ВЫВОД\n👤 От: {row[2]}\n💰 Сумма: {amt} Gold", reply_markup=kb)
-            except: pass
-            
-        bot.send_message(m.chat.id, "⌛ Заявка отправлена администраторам. Вы получите уведомление о результате.")
-    except Exception as e:
-        bot.send_message(m.chat.id, "⚠️ Ошибка при создании заявки.")
-        print(f"❌ Ошибка в proc_with: {e}", flush=True)
-
-@bot.callback_query_handler(func=lambda c: True)
-def cb_inline(c):
-    if c.data.startswith("ok_"):
-        _, r_idx, amt = c.data.split("_")
-        r_idx, amt = int(r_idx), float(amt)
+            bot.send_message(adm, f"🚨 **ЗАЯВКА НА ВЫВОД**\n👤 Игрок: {row[2]}\n💰 Сумма: {amt} Gold", 
+                             parse_mode="Markdown", reply_markup=kb)
         
-        try:
-            row = sheet.row_values(r_idx)
-            old_bal = float(str(row[3]).replace(',', '.'))
-            new_bal = old_bal - amt
-            
-            # Обновляем в таблице
-            sheet.update_cell(r_idx, 4, str(new_bal))
-            # В историю
-            history_sheet.append_row([datetime.now().strftime("%d.%m %H:%M"), row[2], c.from_user.first_name, amt])
-            
-            bot.edit_message_text(f"✅ Выплачено {amt} Gold игроку {row[2]}", c.message.chat.id, c.message.message_id)
-            bot.send_message(row[1], f"✅ Ваша заявка на {amt} Gold одобрена! Баланс обновлен.")
-        except Exception as e:
-            bot.send_message(c.message.chat.id, f"❌ Ошибка БД: {e}")
-    elif c.data == "no":
-        bot.edit_message_text("❌ Заявка отклонена администратором", c.message.chat.id, c.message.message_id)
+        bot.send_message(m.chat.id, "⌛ Заявка отправлена! Ожидайте уведомления от администраторов.")
+    except:
+        bot.send_message(m.chat.id, "❌ Ошибка. Введите число (например: 150).")
 
-# --- 5. ВЕБ-СЕРВЕР (ДЛЯ KOYEB) ---
+def execute_payout(c, r_idx, amt):
+    try:
+        row = sheet.row_values(r_idx)
+        current_bal = float(str(row[3]).replace(',', '.'))
+        new_bal = current_bal - amt
+        
+        sheet.update_cell(r_idx, 4, str(new_bal))
+        if history_sheet:
+            history_sheet.append_row([datetime.now().strftime("%d.%m %H:%M"), row[2], c.from_user.first_name, amt])
+        
+        bot.edit_message_text(f"✅ Выплачено {amt} Gold пользователю {row[2]}", c.message.chat.id, c.message.message_id)
+        bot.send_message(row[1], f"✅ Ваш запрос на вывод {amt} Gold одобрен! Баланс обновлен.")
+    except Exception as e:
+        bot.send_message(c.message.chat.id, f"❌ Ошибка БД: {e}")
+
+# --- 5. ВЕБ-СЕРВЕР ---
 app = Flask(__name__)
 @app.route('/')
 def health(): return "OK", 200
 
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
 # --- 6. ЗАПУСК ---
 if __name__ == "__main__":
-    Thread(target=run_web, daemon=True).start()
-    
+    Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
     while True:
         try:
-            print("🧹 Сброс Webhook и запуск Polling...", flush=True)
             bot.remove_webhook()
-            # skip_pending=True чтобы не спамить старыми сообщениями при рестарте
-            bot.infinity_polling(none_stop=True, skip_pending=True, timeout=60)
-        except Exception as e:
-            print(f"❌ Ошибка цикла: {e}", flush=True)
-            time.sleep(10)
+            bot.infinity_polling(none_stop=True, skip_pending=True)
+        except:
+            time.sleep(5)
