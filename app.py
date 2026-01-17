@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import telebot
 import gspread
 import random
@@ -14,9 +13,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_NAME = os.getenv("SHEET_NAME", "SwedenFINK")
 GCP_JSON_DATA = os.getenv("GCP_JSON")
 
-# Список ID администраторов
 ADMIN_LIST = [7631664265, 6343896085]
-NOTIFY_USER_ID = 7631664265 # Ваш ID для уведомления о запуске
+NOTIFY_USER_ID = 7631664265 
 
 if GCP_JSON_DATA:
     with open("credentials.json", "w") as f:
@@ -30,202 +28,151 @@ def get_sheets():
         gc = gspread.authorize(creds)
         doc = gc.open(SHEET_NAME)
         return doc.sheet1
-    except Exception as e:
-        print(f"Ошибка Google Sheets: {e}")
-        return None
+    except: return None
 
 sheet = get_sheets()
 bot = telebot.TeleBot(BOT_TOKEN)
-u_data = {} # Временное хранилище для шагов перевода/админки
+u_data = {} 
 
-# --- 3. ОБРАБОТЧИКИ МЕНЮ ---
+# --- 3. ДИНАМИЧЕСКОЕ МЕНЮ ---
 
 @bot.message_handler(commands=['start', 'profile'])
 @bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
 def welcome_and_profile(message):
     uid = str(message.from_user.id)
+    user_row = None
     
-    # Создаем основную клавиатуру (кнопки внизу)
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    markup.row("📝 Регистрация", "👤 Мой профиль")
-    markup.row("💸 Перевод")
-    
-    if int(uid) in ADMIN_LIST:
-        markup.row("⚙️ Админ-панель")
-
     try:
         cell = sheet.find(uid, in_column=2)
-        if not cell:
-            return bot.send_message(message.chat.id, "👋 Привет! Ты еще не зарегистрирован. Нажми кнопку ниже.", reply_markup=markup)
+        if cell:
+            user_row = sheet.row_values(cell.row)
+    except: pass
+
+    # Создаем клавиатуру
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    
+    if user_row:
+        # Если аккаунт ЕСТЬ: убираем регистрацию
+        markup.row("👤 Мой профиль", "💸 Перевод")
+        if int(uid) in ADMIN_LIST:
+            markup.row("⚙️ Админ-панель")
+            
+        text = (f"👤 **Профиль: {user_row[2]}**\n"
+                f"💼 Должность: {user_row[4]}\n"
+                f"💰 Баланс: **{user_row[3]} Gold**\n"
+                f"🆔 Код: `{user_row[0]}`")
         
-        row = sheet.row_values(cell.row)
-        text = (f"👤 **Профиль: {row[2]}**\n"
-                f"💼 Должность: {row[4]}\n"
-                f"💰 Баланс: **{row[3]} Gold**\n"
-                f"🆔 Твой код: `{row[0]}`")
-        
-        # Инлайн-кнопка под профилем
+        # Кнопки управления голдой (Инлайн)
         kb = telebot.types.InlineKeyboardMarkup()
-        kb.add(telebot.types.InlineKeyboardButton("📉 Снять Gold", callback_data="pre_withdraw"))
-        
+        kb.row(
+            telebot.types.InlineKeyboardButton("📉 Снять Gold", callback_data="pre_withdraw"),
+            telebot.types.InlineKeyboardButton("💸 Перевод", callback_data="pre_transfer")
+        )
         bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
-        bot.send_message(message.chat.id, "Доступные действия с балансом:", reply_markup=kb)
-    except:
-        bot.send_message(message.chat.id, "👋 Ошибка загрузки данных. Попробуй /start", reply_markup=markup)
+        bot.send_message(message.chat.id, "Выберите финансовую операцию:", reply_markup=kb)
+    else:
+        # Если аккаунта НЕТ: только кнопка регистрации
+        markup.row("📝 Регистрация")
+        bot.send_message(message.chat.id, "👋 Привет! Твой аккаунт не найден. Пройди регистрацию:", reply_markup=markup)
 
-# --- 4. ЛОГИКА ПЕРЕВОДА (МЕЖДУ ИГРОКАМИ) ---
+# --- 4. ЛОГИКА ПЕРЕВОДА ---
 
-@bot.message_handler(commands=['transfer'])
 @bot.message_handler(func=lambda m: m.text == "💸 Перевод")
-def transfer_start(m):
-    msg = bot.send_message(m.chat.id, "Введите часть Ника игрока, которому хотите перевести Gold:")
+@bot.callback_query_handler(func=lambda c: c.data == "pre_transfer")
+def transfer_init(obj):
+    # Работает и на текстовую кнопку, и на инлайн-кнопку
+    chat_id = obj.chat.id if hasattr(obj, 'chat') else obj.message.chat.id
+    msg = bot.send_message(chat_id, "Введите часть Ника игрока для поиска:")
     bot.register_next_step_handler(msg, search_recipient)
 
 def search_recipient(m):
     query = m.text.lower()
     try:
-        all_players = sheet.get_all_values()[1:] # Пропускаем заголовок
-        # Ищем совпадения в 3-м столбце (Ник), исключая себя
+        all_players = sheet.get_all_values()[1:]
         found = [p for p in all_players if query in p[2].lower() and p[1] != str(m.from_user.id)]
         
         if not found:
-            return bot.send_message(m.chat.id, "❌ Игрок не найден. Попробуйте еще раз.")
+            return bot.send_message(m.chat.id, "❌ Никто не найден.")
         
         kb = telebot.types.InlineKeyboardMarkup()
-        for p in found[:8]: # Ограничиваем список 8 результатами
+        for p in found[:8]:
             kb.add(telebot.types.InlineKeyboardButton(f"{p[2]} ({p[4]})", callback_data=f"tr_{p[1]}"))
-        
-        bot.send_message(m.chat.id, "Выберите получателя из списка:", reply_markup=kb)
-    except:
-        bot.send_message(m.chat.id, "⚠️ Ошибка при поиске игроков.")
+        bot.send_message(m.chat.id, "Выберите получателя:", reply_markup=kb)
+    except: bot.send_message(m.chat.id, "Ошибка базы данных.")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("tr_"))
-def ask_transfer_amount(c):
-    target_id = c.data.split("_")[1]
-    u_data[c.from_user.id] = {'target_id': target_id}
-    
-    bot.delete_message(c.message.chat.id, c.message.message_id)
-    msg = bot.send_message(c.message.chat.id, "Введите сумму перевода (только число):")
-    bot.register_next_step_handler(msg, process_transfer_final)
+def ask_amount(c):
+    u_data[c.from_user.id] = {'target_id': c.data.split("_")[1]}
+    bot.edit_message_text("Введите сумму Gold для перевода:", c.message.chat.id, c.message.message_id)
+    bot.register_next_step_handler(c.message, process_transfer)
 
-def process_transfer_final(m):
+def process_transfer(m):
     try:
-        amount = float(m.text.replace(',', '.'))
-        if amount <= 0: return bot.send_message(m.chat.id, "❌ Сумма должна быть больше нуля.")
+        amt = float(m.text.replace(',', '.'))
+        if amt <= 0: return bot.send_message(m.chat.id, "❌ Сумма должна быть > 0")
         
-        # Ищем отправителя и получателя
         s_cell = sheet.find(str(m.from_user.id), in_column=2)
         t_cell = sheet.find(u_data[m.from_user.id]['target_id'], in_column=2)
         
         s_row = sheet.row_values(s_cell.row)
         t_row = sheet.row_values(t_cell.row)
         
-        s_bal = float(s_row[3].replace(',', '.'))
+        s_bal = float(s_row[3])
+        if s_bal < amt: return bot.send_message(m.chat.id, f"❌ Недостаточно Gold (Баланс: {s_bal})")
         
-        if s_bal < amount:
-            return bot.send_message(m.chat.id, f"❌ Недостаточно Gold. Твой баланс: {s_bal}")
+        sheet.update_cell(s_cell.row, 4, str(s_bal - amt))
+        sheet.update_cell(t_cell.row, 4, str(float(t_row[3]) + amt))
         
-        # Выполняем транзакцию
-        sheet.update_cell(s_cell.row, 4, str(s_bal - amount))
-        sheet.update_cell(t_cell.row, 4, str(float(t_row[3].replace(',', '.')) + amount))
-        
-        # Уведомления
-        bot.send_message(m.chat.id, f"✅ Вы перевели {amount} Gold игроку {t_row[2]}.")
-        bot.send_message(t_row[1], f"💰 Вам поступил перевод!\n👤 Отправитель: {s_row[2]}\n➕ Сумма: {amount} Gold")
-    except:
-        bot.send_message(m.chat.id, "❌ Ошибка. Введите корректное число.")
+        bot.send_message(m.chat.id, f"✅ Вы успешно перевели {amt} Gold игроку {t_row[2]}.")
+        bot.send_message(t_row[1], f"💰 Вам поступил перевод от {s_row[2]}: +{amt} Gold")
+    except: bot.send_message(m.chat.id, "❌ Ошибка. Введите число.")
 
-# --- 5. РЕГИСТРАЦИЯ ---
+# --- 5. СНЯТИЕ И АДМИНКА ---
 
-@bot.message_handler(commands=['registration'])
-@bot.message_handler(func=lambda m: m.text == "📝 Регистрация")
-def registration_start(m):
-    if sheet.find(str(m.from_user.id), in_column=2):
-        return bot.send_message(m.chat.id, "❌ Вы уже зарегистрированы.")
-    msg = bot.send_message(m.chat.id, "Введите ваш Игровой Ник:")
-    bot.register_next_step_handler(msg, registration_finish)
+@bot.callback_query_handler(func=lambda c: c.data == "pre_withdraw")
+def withdraw_init(c):
+    msg = bot.send_message(c.message.chat.id, "Сколько Gold вы хотите снять?")
+    bot.register_next_step_handler(msg, send_to_adm)
 
-def registration_finish(m):
-    try:
-        pwd = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-        # Формат: Пароль, TG_ID, Ник, Баланс, Должность
-        sheet.append_row([pwd, str(m.from_user.id), m.text, "0", "Игрок"])
-        bot.send_message(m.chat.id, f"✅ Регистрация завершена!\nВаш уникальный ID: `{pwd}`")
-    except:
-        bot.send_message(m.chat.id, "❌ Ошибка при сохранении в таблицу.")
-
-# --- 6. АДМИН-ПАНЕЛЬ И СНЯТИЕ ---
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Админ-панель")
-def admin_panel(m):
-    if m.from_user.id not in ADMIN_LIST: return
-    kb = telebot.types.InlineKeyboardMarkup()
-    kb.add(telebot.types.InlineKeyboardButton("📊 Статистика", callback_data="adm_stats"))
-    kb.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="adm_broadcast"))
-    bot.send_message(m.chat.id, "🛠 **Панель администратора**", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: True)
-def callback_handler(c):
-    if c.data == "pre_withdraw":
-        msg = bot.send_message(c.message.chat.id, "Введите сумму для снятия:")
-        bot.register_next_step_handler(msg, withdraw_request_admin)
-    
-    elif c.data.startswith("appr_"):
-        # Одобрение выплаты админом
-        _, r_idx, amt = c.data.split("_")
-        confirm_payout(c, int(r_idx), float(amt))
-        
-    elif c.data == "adm_stats":
-        count = len(sheet.get_all_values()) - 1
-        bot.send_message(c.message.chat.id, f"📊 Всего игроков в базе: {count}")
-
-    bot.answer_callback_query(c.id)
-
-def withdraw_request_admin(m):
+def send_to_adm(m):
     try:
         amt = float(m.text)
-        cell = sheet.find(str(m.from_user.id), in_column=2)
-        kb = telebot.types.InlineKeyboardMarkup()
-        kb.add(telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"appr_{cell.row}_{amt}"))
-        
+        kb = telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"ok_{m.from_user.id}_{amt}"))
         for adm in ADMIN_LIST:
-            bot.send_message(adm, f"🚨 **ЗАЯВКА НА ВЫВОД**\nИгрок: {m.from_user.first_name}\nСумма: {amt} Gold", reply_markup=kb)
-        bot.send_message(m.chat.id, "⌛ Заявка отправлена администраторам.")
-    except:
-        bot.send_message(m.chat.id, "❌ Ошибка. Введите число.")
+            bot.send_message(adm, f"🚨 Заявка на вывод: {m.from_user.first_name}\nСумма: {amt} Gold", reply_markup=kb)
+        bot.send_message(m.chat.id, "⌛ Заявка отправлена админам.")
+    except: bot.send_message(m.chat.id, "❌ Введите число.")
 
-def confirm_payout(c, row_idx, amount):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ok_"))
+def approve_payout(c):
+    _, u_id, amt = c.data.split("_")
     try:
-        row = sheet.row_values(row_idx)
-        current_bal = float(row[3].replace(',', '.'))
-        new_bal = current_bal - amount
-        
-        sheet.update_cell(row_idx, 4, str(new_bal))
-        bot.edit_message_text(f"✅ Выплата {amount} Gold игроку {row[2]} подтверждена.", c.message.chat.id, c.message.message_id)
-        bot.send_message(row[1], f"✅ Твой запрос на снятие {amount} Gold одобрен!")
-    except:
-        bot.send_message(c.message.chat.id, "❌ Ошибка при обновлении таблицы.")
+        cell = sheet.find(u_id, in_column=2)
+        row = sheet.row_values(cell.row)
+        new_bal = float(row[3]) - float(amt)
+        sheet.update_cell(cell.row, 4, str(new_bal))
+        bot.edit_message_text(f"✅ Выплачено {amt} для {row[2]}", c.message.chat.id, c.message.message_id)
+        bot.send_message(u_id, f"✅ Твой вывод на {amt} Gold одобрен!")
+    except: bot.send_message(c.message.chat.id, "❌ Ошибка при выплате.")
 
-# --- 7. ЗАПУСК И ПРЕДОТВРАЩЕНИЕ КОНФЛИКТОВ ---
+@bot.message_handler(func=lambda m: m.text == "📝 Регистрация")
+def reg_final(m):
+    try:
+        if sheet.find(str(m.from_user.id), in_column=2): return
+        pwd = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+        sheet.append_row([pwd, str(m.from_user.id), m.from_user.first_name, "0", "Игрок"])
+        bot.send_message(m.chat.id, f"✅ Аккаунт создан! Теперь напиши /start для обновления меню.")
+    except: bot.send_message(m.chat.id, "❌ Ошибка регистрации.")
 
+# --- 6. ЗАПУСК ---
 app = Flask(__name__)
 @app.route('/')
-def health_check(): return "OK", 200
+def h(): return "OK", 200
 
 if __name__ == "__main__":
-    # Запуск веб-сервера для Koyeb
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
-    
-    # Решение ошибки 409 Conflict: удаляем вебхук перед стартом
     bot.remove_webhook()
-    time.sleep(1) # Даем Telegram время закрыть старые сессии
-    
-    # Уведомление о запуске
-    try:
-        bot.send_message(NOTIFY_USER_ID, "🚀 **Бот успешно перезапущен и готов к работе!**", parse_mode="Markdown")
-        print("🚀 Бот запущен")
-    except:
-        print("⚠️ Не удалось отправить уведомление о запуске")
-
-    # Бесконечный цикл с игнорированием старых сообщений (skip_pending)
+    time.sleep(1)
+    try: bot.send_message(NOTIFY_USER_ID, "🚀 Бот запущен")
+    except: pass
     bot.infinity_polling(none_stop=True, skip_pending=True)
