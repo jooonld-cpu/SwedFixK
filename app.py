@@ -52,29 +52,24 @@ def gen_id():
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    uid = message.from_user.id
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    
-    if uid in ADMIN_LIST:
-        markup.add("📊 Админ-панель", "👤 Мой профиль")
-        text = (f"👑 **Добро пожаловать в Шведскую Финансовую систему!**\n\n"
-                f"Вам, как администратору, доступны возможности управления.\n"
-                f"Используйте кнопку ниже для доступа к инструментам.")
-        bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
-    else:
-        markup.add("📝 Регистрация", "👤 Мой профиль")
-        bot.send_message(message.chat.id, "👋 Добро пожаловать в SwedenFINK!\nИспользуйте меню для работы с балансом:", reply_markup=markup)
+    markup.add("📝 Регистрация", "👤 Мой профиль")
+    bot.send_message(message.chat.id, "👋 Добро пожаловать в SwedenFINK!\nИспользуйте меню ниже для работы:", reply_markup=markup)
 
-# --- АДМИН ПАНЕЛЬ ---
-@bot.message_handler(func=lambda m: m.text == "📊 Админ-панель")
-def admin_menu(m):
-    if m.from_user.id not in ADMIN_LIST: return
-    
+# --- ТЕХНИЧЕСКОЕ МЕНЮ АДМИНА (/config) ---
+@bot.message_handler(commands=['config'])
+def admin_config(message):
+    if message.from_user.id not in ADMIN_LIST:
+        return # Бот просто проигнорирует команду для обычных пользователей
+
     kb = telebot.types.InlineKeyboardMarkup()
-    kb.row(telebot.types.InlineKeyboardButton("📈 Статистика", callback_data="adm_stats"))
-    kb.row(telebot.types.InlineKeyboardButton("📢 Сделать рассылку", callback_data="adm_broadcast"))
+    kb.row(telebot.types.InlineKeyboardButton("📊 Статистика системы", callback_data="adm_stats"))
+    kb.row(telebot.types.InlineKeyboardButton("📢 Массовая рассылка", callback_data="adm_broadcast"))
+    kb.row(telebot.types.InlineKeyboardButton("💰 Изменить баланс игроку", callback_data="adm_edit_bal"))
     
-    bot.send_message(m.chat.id, "🛠 **Панель управления администратора:**", parse_mode="Markdown", reply_markup=kb)
+    text = ("⚙️ **Панель управления SwedenFINK**\n\n"
+            "Вам доступны инструменты мониторинга и редактирования базы данных.")
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=kb)
 
 # --- РЕГИСТРАЦИЯ ---
 @bot.message_handler(func=lambda m: m.text == "📝 Регистрация")
@@ -135,12 +130,17 @@ def handle_callback(c):
     elif c.data == "adm_stats":
         all_rows = sheet.get_all_values()
         count = len(all_rows) - 1
-        bot.send_message(c.message.chat.id, f"📊 Всего зарегистрировано в системе: {count} чел.")
+        bot.send_message(c.message.chat.id, f"📊 Всего зарегистрировано: {count} чел.")
         bot.answer_callback_query(c.id)
 
     elif c.data == "adm_broadcast":
-        msg = bot.send_message(c.message.chat.id, "Введите текст рассылки. Его получат ВСЕ игроки:")
+        msg = bot.send_message(c.message.chat.id, "Введите текст для всех игроков:")
         bot.register_next_step_handler(msg, start_broadcast)
+        bot.answer_callback_query(c.id)
+
+    elif c.data == "adm_edit_bal":
+        msg = bot.send_message(c.message.chat.id, "Введите 12-значный ID игрока, кому нужно изменить баланс:")
+        bot.register_next_step_handler(msg, admin_find_user_for_bal)
         bot.answer_callback_query(c.id)
 
     elif c.data.startswith("adm_ok_"):
@@ -150,36 +150,51 @@ def handle_callback(c):
     elif c.data == "adm_no":
         bot.edit_message_text("❌ Заявка отклонена.", c.message.chat.id, c.message.message_id)
 
-# --- ФУНКЦИИ РАССЫЛКИ И ВЫВОДА ---
+# --- АДМИНСКИЕ ФУНКЦИИ (БАЛАНС И РАССЫЛКА) ---
+def admin_find_user_for_bal(m):
+    try:
+        cell = sheet.find(m.text.strip(), in_column=1)
+        row = sheet.row_values(cell.row)
+        u_data[m.from_user.id] = {'edit_row': cell.row}
+        msg = bot.send_message(m.chat.id, f"👤 Игрок: {row[2]}\n💰 Текущий баланс: {row[3]}\n\nВведите новое значение баланса:")
+        bot.register_next_step_handler(msg, admin_save_new_bal)
+    except: bot.send_message(m.chat.id, "❌ Пользователь с таким ID не найден.")
+
+def admin_save_new_bal(m):
+    try:
+        new_val = m.text.replace(',', '.')
+        row_idx = u_data[m.from_user.id]['edit_row']
+        sheet.update_cell(row_idx, 4, new_val)
+        bot.send_message(m.chat.id, f"✅ Баланс успешно обновлен на {new_val}")
+    except: bot.send_message(m.chat.id, "❌ Ошибка. Введите число.")
+
 def start_broadcast(m):
-    if m.from_user.id not in ADMIN_LIST: return
-    all_data = sheet.get_all_values()[1:] # Пропускаем заголовок
+    all_data = sheet.get_all_values()[1:]
     count = 0
     for row in all_data:
         try:
-            bot.send_message(row[1], f"📢 **Оповещение от администрации:**\n\n{m.text}", parse_mode="Markdown")
+            bot.send_message(row[1], f"📢 **Оповещение:**\n\n{m.text}", parse_mode="Markdown")
             count += 1
-            time.sleep(0.1) # Защита от спам-фильтра Telegram
+            time.sleep(0.05)
         except: continue
-    bot.send_message(m.chat.id, f"✅ Рассылка завершена. Доставлено {count} игрокам.")
+    bot.send_message(m.chat.id, f"✅ Доставлено {count} игрокам.")
 
+# --- СНЯТИЕ И ВЫВОД ---
 def process_withdraw_request(m):
     try:
         amt = float(m.text.replace(',', '.'))
         cell = sheet.find(str(m.from_user.id), in_column=2)
         row = sheet.row_values(cell.row)
         bal = float(str(row[3]).replace(',', '.'))
-        
-        if bal < amt: return bot.send_message(m.chat.id, "❌ Недостаточно средств.")
+        if bal < amt: return bot.send_message(m.chat.id, "❌ Недостаточно Gold.")
 
         kb = telebot.types.InlineKeyboardMarkup()
-        kb.add(telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adm_ok_{cell.row}_{amt}"),
-               telebot.types.InlineKeyboardButton("❌ Отказать", callback_data="adm_no"))
-        
+        kb.add(telebot.types.InlineKeyboardButton("✅ Да", callback_data=f"adm_ok_{cell.row}_{amt}"),
+               telebot.types.InlineKeyboardButton("❌ Нет", callback_data="adm_no"))
         for adm in ADMIN_LIST:
-            bot.send_message(adm, f"🚨 **ЗАЯВКА**\n👤 {row[2]}\n💰 {amt} Gold", parse_mode="Markdown", reply_markup=kb)
-        bot.send_message(m.chat.id, "⌛ Заявка отправлена.")
-    except: bot.send_message(m.chat.id, "❌ Ошибка. Введите число.")
+            bot.send_message(adm, f"🚨 **ЗАЯВКА**\n👤 {row[2]}\n💰 {amt} Gold", reply_markup=kb)
+        bot.send_message(m.chat.id, "⌛ Отправлено на проверку.")
+    except: bot.send_message(m.chat.id, "❌ Введите число.")
 
 def execute_payout(c, r_idx, amt):
     try:
@@ -188,8 +203,8 @@ def execute_payout(c, r_idx, amt):
         sheet.update_cell(r_idx, 4, str(new_bal))
         if history_sheet:
             history_sheet.append_row([datetime.now().strftime("%d.%m %H:%M"), row[2], c.from_user.first_name, amt])
-        bot.edit_message_text(f"✅ Выплачено {amt} Gold пользователю {row[2]}", c.message.chat.id, c.message.message_id)
-        bot.send_message(row[1], f"✅ Ваш вывод {amt} Gold одобрен!")
+        bot.edit_message_text(f"✅ Выплачено {amt}", c.message.chat.id, c.message.message_id)
+        bot.send_message(row[1], f"✅ Вывод {amt} Gold одобрен!")
     except: bot.send_message(c.message.chat.id, "❌ Ошибка БД.")
 
 # --- 5. ВЕБ-СЕРВЕР ---
