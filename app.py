@@ -2,6 +2,7 @@ import os
 import time
 import telebot
 import gspread
+import psycopg2
 import random
 import string
 from oauth2client.service_account import ServiceAccountCredentials
@@ -12,7 +13,7 @@ from threading import Thread
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_NAME = os.getenv("SHEET_NAME", "SwedenFINK")
 GCP_JSON_DATA = os.getenv("GCP_JSON")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_LIST = [7631664265, 6343896085]
 NOTIFY_USER_ID = 7631664265 
 
@@ -20,7 +21,10 @@ if GCP_JSON_DATA:
     with open("credentials.json", "w") as f:
         f.write(GCP_JSON_DATA)
 
-def get_sheets():
+# --- 2. ПОДКЛЮЧЕНИЯ ---
+
+# Подключение к Google Таблицам
+def get_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
@@ -28,168 +32,153 @@ def get_sheets():
         return gc.open(SHEET_NAME).sheet1
     except: return None
 
-sheet = get_sheets()
+# Подключение к PostgreSQL
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 bot = telebot.TeleBot(BOT_TOKEN)
-u_data = {} 
 
-# --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ОПТИМИЗАЦИЯ) ---
+# --- 3. ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ ---
 
-def get_user_from_db(tg_id):
-    """Быстрый поиск пользователя без лишних запросов к API Google"""
+def init_db():
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                pwd TEXT,
+                tg_id TEXT PRIMARY KEY,
+                nickname TEXT,
+                balance FLOAT DEFAULT 0,
+                role TEXT DEFAULT 'Игрок'
+            )
+        """)
+    conn.commit()
+    conn.close()
+
+@bot.message_handler(commands=['migrate'])
+def migrate_data(message):
+    if message.from_user.id not in ADMIN_LIST: return
+
+    bot.send_message(message.chat.id, "⏳ Начинаю перенос данных из Google Таблиц...")
+    
+    sheet = get_google_sheet()
+    if not sheet:
+        return bot.send_message(message.chat.id, "❌ Ошибка: не удалось подключиться к Google Таблице.")
+
+    data = sheet.get_all_values()[1:] # Пропускаем заголовок
+    conn = get_db_connection()
+    
     try:
-        all_data = sheet.get_all_values()
-        for idx, row in enumerate(all_data):
-            if row[1] == str(tg_id):
-                return row, idx + 1 # Возвращаем данные строки и её номер (1-based)
-        return None, None
-    except: return None, None
+        with conn.cursor() as cur:
+            for row in data:
+                # Вставляем данные, если tg_id уже есть — обновляем баланс и ник
+                cur.execute("""
+                    INSERT INTO users (pwd, tg_id, nickname, balance, role)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (tg_id) DO UPDATE SET
+                    nickname = EXCLUDED.nickname,
+                    balance = EXCLUDED.balance,
+                    role = EXCLUDED.role
+                """, (row[0], row[1], row[2], float(row[3].replace(',', '.')), row[4]))
+        conn.commit()
+        bot.send_message(message.chat.id, "✅ Данные перенесены.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка миграции: {e}")
+    finally:
+        conn.close()
 
-# --- 3. ОСНОВНАЯ ЛОГИКА МЕНЮ ---
+# --- 4. ОСНОВНАЯ ЛОГИКА (БАЗА ДАННЫХ) ---
+
+def get_user_db(tg_id):
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE tg_id = %s", (str(tg_id),))
+        user = cur.fetchone()
+    conn.close()
+    return user
 
 @bot.message_handler(commands=['start', 'profile'])
 @bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
-def show_profile(message):
-    uid = message.from_user.id
-    user_row, _ = get_user_from_db(uid)
-    
+def show_profile(m):
+    user = get_user_db(m.from_user.id)
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     
-    if user_row:
-        # Если зарегистрирован: убираем регистрацию из кнопок
+    if user:
         markup.row("👤 Мой профиль", "💸 Перевод")
-        if uid in ADMIN_LIST:
-            markup.row("⚙️ Админ-панель")
-            
-        text = (f"👤 **Профиль: {user_row[2]}**\n"
-                f"💼 Должность: {user_row[4]}\n"
-                f"💰 Баланс: **{user_row[3]} Gold**\n"
-                f"🆔 Твой код: `{user_row[0]}`")
+        if m.from_user.id in ADMIN_LIST: markup.row("⚙️ Админ-панель")
         
-        # Кнопки под сообщением (Снять и Перевести в одном месте)
+        text = (f"👤 **{user[2]}**\n"
+                f"💰 Баланс: **{user[3]} Gold**\n"
+                f"🆔 Код: `{user[0]}`")
+        
         kb = telebot.types.InlineKeyboardMarkup()
         kb.row(
             telebot.types.InlineKeyboardButton("📉 Снять Gold", callback_data="pre_withdraw"),
             telebot.types.InlineKeyboardButton("💸 Перевод", callback_data="pre_transfer")
         )
-        bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
-        bot.send_message(message.chat.id, "Управление средствами:", reply_markup=kb)
+        bot.send_message(m.chat.id, text, parse_mode="Markdown", reply_markup=markup)
+        bot.send_message(m.chat.id, "Действия:", reply_markup=kb)
     else:
-        # Если НЕ зарегистрирован
         markup.row("📝 Регистрация")
-        bot.send_message(message.chat.id, "👋 Привет! Ты не зарегистрирован. Нажми кнопку ниже:", reply_markup=markup)
+        bot.send_message(m.chat.id, "👋 Аккаунт не найден. Зарегистрируйтесь:", reply_markup=markup)
 
-# --- 4. ЛОГИКА ПЕРЕВОДА ---
+# --- 5. ЛОГИКА ПЕРЕВОДА (БАЗА ДАННЫХ) ---
 
 @bot.callback_query_handler(func=lambda c: c.data == "pre_transfer")
-@bot.message_handler(func=lambda m: m.text == "💸 Перевод")
-def transfer_init(obj):
-    chat_id = obj.chat.id if hasattr(obj, 'chat') else obj.message.chat.id
-    msg = bot.send_message(chat_id, "Введите часть Ника игрока для поиска:")
-    bot.register_next_step_handler(msg, search_recipient)
+def transfer_callback(c):
+    msg = bot.send_message(c.message.chat.id, "Введите часть Ника для поиска:")
+    bot.register_next_step_handler(msg, search_db)
 
-def search_recipient(m):
-    query = m.text.lower()
-    try:
-        all_players = sheet.get_all_values()[1:]
-        found = [p for p in all_players if query in p[2].lower() and p[1] != str(m.from_user.id)]
-        
-        if not found:
-            return bot.send_message(m.chat.id, "❌ Игрок не найден.")
-        
-        kb = telebot.types.InlineKeyboardMarkup()
-        for p in found[:8]:
-            kb.add(telebot.types.InlineKeyboardButton(f"{p[2]} ({p[4]})", callback_data=f"tr_{p[1]}"))
-        bot.send_message(m.chat.id, "Выберите получателя:", reply_markup=kb)
-    except: bot.send_message(m.chat.id, "Ошибка поиска.")
+def search_db(m):
+    query = f"%{m.text.lower()}%"
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT nickname, tg_id FROM users WHERE LOWER(nickname) LIKE %s AND tg_id != %s LIMIT 8", (query, str(m.from_user.id)))
+        found = cur.fetchall()
+    conn.close()
+
+    if not found: return bot.send_message(m.chat.id, "❌ Никто не найден.")
+    
+    kb = telebot.types.InlineKeyboardMarkup()
+    for nick, tid in found:
+        kb.add(telebot.types.InlineKeyboardButton(nick, callback_data=f"tr_{tid}"))
+    bot.send_message(m.chat.id, "Выберите игрока:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("tr_"))
-def ask_amount(c):
-    u_data[c.from_user.id] = {'target_id': c.data.split("_")[1]}
-    bot.delete_message(c.message.chat.id, c.message.message_id)
-    msg = bot.send_message(c.message.chat.id, "Введите сумму Gold для перевода:")
-    bot.register_next_step_handler(msg, process_transfer)
+def ask_amt(c):
+    target_id = c.data.split("_")[1]
+    msg = bot.send_message(c.message.chat.id, "Сумма перевода:")
+    bot.register_next_step_handler(msg, lambda m: execute_transfer(m, target_id))
 
-def process_transfer(m):
-    try:
-        amount = float(m.text.replace(',', '.'))
-        if amount <= 0: return bot.send_message(m.chat.id, "❌ Сумма должна быть больше 0.")
-        
-        # Загружаем данные отправителя и получателя
-        s_row, s_idx = get_user_from_db(m.from_user.id)
-        t_row, t_idx = get_user_from_db(u_data[m.from_user.id]['target_id'])
-        
-        s_bal = float(s_row[3].replace(',', '.'))
-        if s_bal < amount:
-            return bot.send_message(m.chat.id, f"❌ Недостаточно Gold. Баланс: {s_bal}")
-        
-        # Обновляем таблицу (API Google вызывается только здесь)
-        sheet.update_cell(s_idx, 4, str(s_bal - amount))
-        sheet.update_cell(t_idx, 4, str(float(t_row[3].replace(',', '.')) + amount))
-        
-        bot.send_message(m.chat.id, f"✅ Перевод {amount} Gold для {t_row[2]} успешно выполнен!")
-        bot.send_message(t_row[1], f"💰 Вам поступил перевод от {s_row[2]}: +{amount} Gold")
-    except:
-        bot.send_message(m.chat.id, "❌ Ошибка. Введите число.")
-
-# --- 5. СНЯТИЕ И АДМИНКА ---
-
-@bot.callback_query_handler(func=lambda c: c.data == "pre_withdraw")
-def withdraw_init(c):
-    msg = bot.send_message(c.message.chat.id, "Какую сумму вы хотите снять?")
-    bot.register_next_step_handler(msg, send_to_admin)
-
-def send_to_admin(m):
+def execute_transfer(m, to_id):
     try:
         amt = float(m.text)
-        user_row, _ = get_user_data_local(m.from_user.id)
-        kb = telebot.types.InlineKeyboardMarkup().add(
-            telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"ap_{m.from_user.id}_{amt}")
-        )
-        for adm in ADMIN_LIST:
-            bot.send_message(adm, f"🚨 Заявка: {m.from_user.first_name}\nСумма: {amt} Gold", reply_markup=kb)
-        bot.send_message(m.chat.id, "⌛ Заявка отправлена администрации.")
-    except: bot.send_message(m.chat.id, "❌ Введите число.")
+        sender = get_user_db(m.from_user.id)
+        receiver = get_user_db(to_id)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("ap_"))
-def approve_withdraw(c):
-    _, uid, amt = c.data.split("_")
-    try:
-        user_row, row_idx = get_user_from_db(uid)
-        new_bal = float(user_row[3]) - float(amt)
-        sheet.update_cell(row_idx, 4, str(new_bal))
-        bot.edit_message_text(f"✅ Выплата {amt} для {user_row[2]} одобрена.", c.message.chat.id, c.message.message_id)
-        bot.send_message(uid, f"✅ Твой вывод на {amt} Gold одобрен!")
-    except: bot.send_message(c.message.chat.id, "❌ Ошибка обновления таблицы.")
+        if sender[3] < amt: return bot.send_message(m.chat.id, "❌ Недостаточно Gold.")
 
-# --- 6. РЕГИСТРАЦИЯ ---
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET balance = balance - %s WHERE tg_id = %s", (amt, str(m.from_user.id)))
+            cur.execute("UPDATE users SET balance = balance + %s WHERE tg_id = %s", (amt, str(to_id)))
+        conn.commit()
+        conn.close()
 
-@bot.message_handler(func=lambda m: m.text == "📝 Регистрация")
-def registration(m):
-    if get_user_from_db(m.from_user.id)[0]:
-        return bot.send_message(m.chat.id, "❌ Вы уже зарегистрированы.")
-    msg = bot.send_message(m.chat.id, "Введите ваш игровой ник:")
-    bot.register_next_step_handler(msg, finish_reg)
+        bot.send_message(m.chat.id, f"✅ Переведено {amt} Gold игроку {receiver[2]}.")
+        bot.send_message(to_id, f"💰 Поступил перевод от {sender[2]}: +{amt} Gold")
+    except: bot.send_message(m.chat.id, "❌ Ошибка.")
 
-def finish_reg(m):
-    pwd = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-    sheet.append_row([pwd, str(m.from_user.id), m.text, "0", "Игрок"])
-    bot.send_message(m.chat.id, "✅ Регистрация завершена! Напиши /start, чтобы обновить кнопки.")
-
-# --- 7. ЗАПУСК ---
+# --- 6. ЗАПУСК ---
 app = Flask(__name__)
 @app.route('/')
 def h(): return "OK", 200
 
 if __name__ == "__main__":
+    init_db()
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
-    
-    # Решение проблем с задержкой и 409 Conflict
     bot.remove_webhook()
     time.sleep(1)
-    
-    try:
-        bot.send_message(NOTIFY_USER_ID, "🚀 Бот запущен и оптимизирован!")
+    try: bot.send_message(NOTIFY_USER_ID, "🚀 Бот запущен (База Данных)")
     except: pass
-
     bot.infinity_polling(none_stop=True, skip_pending=True)
-
