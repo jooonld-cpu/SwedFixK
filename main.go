@@ -5,16 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
 	"gopkg.in/telebot.v3"
 )
 
-// Конфигурация
 const AdminID = 7631664265
 const WebAppURL = "https://jooonld-cpu.github.io/SwedenFixKFront.github.io/"
 
@@ -22,20 +21,19 @@ type WebAppData struct {
 	Action string  `json:"action"`
 	Nick   string  `json:"nick"`
 	Role   string  `json:"role"`
-	Target int64   `json:"target_id"`
+	Target string  `json:"target_id"`
 	Type   string  `json:"type"`
 	Amount float64 `json:"amount"`
 }
 
 func main() {
-	// 1. Подключение к БД
+	// Подключение к БД
 	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatal("Ошибка БД:", err)
+		log.Fatal(err)
 	}
-	defer db.Close()
 
-	// Создание таблицы если нет
+	// Инициализация таблицы
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
 		tg_id TEXT PRIMARY KEY,
 		nickname TEXT,
@@ -43,7 +41,7 @@ func main() {
 		role TEXT
 	)`)
 
-	// 2. Настройка бота
+	// Настройка бота
 	pref := telebot.Settings{
 		Token:  os.Getenv("BOT_TOKEN"),
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
@@ -54,91 +52,84 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Уведомление о запуске
-	b.Send(&telebot.User{ID: AdminID}, "🚀 Бот успешно запущен на Golang!")
+	// Запуск Health Check сервера для Koyeb (чтобы не было ошибки 8080)
+	go http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "OK")
+	}))
 
-	// 3. Обработка команды /start
+	// Обработка /start
 	b.Handle("/start", func(c telebot.Context) error {
-		var exists bool
+		uid := strconv.FormatInt(c.Sender().ID, 10)
 		var nick, role string
 		var balance float64
-		uid := strconv.FormatInt(c.Sender().ID, 10)
 
 		err := db.QueryRow("SELECT nickname, balance, role FROM users WHERE tg_id=$1", uid).Scan(&nick, &balance, &role)
+		
+		exists := "true"
 		if err == sql.ErrNoRows {
-			exists = false
-		} else {
-			exists = true
+			exists = "false"
 		}
 
-		isAdmin := c.Sender().ID == AdminID
-		// Формируем ссылку для Web App
-		url := fmt.Sprintf("%s?exists=%t&admin=%t&nick=%s&role=%s&balance=%f&v=%d", 
+		isAdmin := "false"
+		if c.Sender().ID == AdminID {
+			isAdmin = "true"
+		}
+
+		// Формируем URL для Mini App
+		finalURL := fmt.Sprintf("%s?exists=%s&admin=%s&nick=%s&role=%s&balance=%f&v=%d",
 			WebAppURL, exists, isAdmin, nick, role, balance, time.Now().Unix())
 
 		menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
-		btn := menu.WebApp("💎 Открыть Меню", &telebot.WebApp{URL: url})
+		btn := menu.WebApp("💎 Открыть Меню", &telebot.WebApp{URL: finalURL})
 		menu.Reply(menu.Row(btn))
 
-		text := "👋 Добро пожаловать! Используйте меню ниже:"
-		if !exists {
-			text = "👋 Привет! Нужно зарегистрироваться через меню."
-		}
-		return c.Send(text, menu)
+		return c.Send("Нажмите кнопку ниже, чтобы войти в кабинет или зарегистрироваться:", menu)
 	})
 
-	// 4. Обработка данных из Mini App (Регистрация)
+	// Обработка данных из Web App
 	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
 		var data WebAppData
 		err := json.Unmarshal([]byte(c.Message().WebAppData.Data), &data)
 		if err != nil {
-			return c.Send("Ошибка данных")
+			return nil
 		}
 
 		if data.Action == "register" {
 			uid := strconv.FormatInt(c.Sender().ID, 10)
-			_, err := db.Exec("INSERT INTO users (tg_id, nickname, balance, role) VALUES ($1, $2, 0, $3)", 
+			_, err := db.Exec("INSERT INTO users (tg_id, nickname, role, balance) VALUES ($1, $2, $3, 0) ON CONFLICT (tg_id) DO UPDATE SET nickname=$2, role=$3",
 				uid, data.Nick, data.Role)
 			if err != nil {
-				return c.Send("Ошибка регистрации в БД")
+				return c.Send("Ошибка сохранения.")
 			}
-			return c.Send(fmt.Sprintf("✅ Готово, %s! Нажми /start снова.", data.Nick))
+			return c.Send(fmt.Sprintf("✅ Регистрация завершена!\nНик: %s\nДолжность: %s\n\nНажми /start ещё раз.", data.Nick, data.Role))
 		}
 		return nil
 	})
 
-	// 5. Админ-команды через текст (Пример: /manage ID действие сумма)
-	// Формат: /set 123456789 100 (добавить 100)
+	// АДМИН КОМАНДЫ (текстовые)
 	b.Handle("/set", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID {
-			return nil
-		}
-		args := c.Args()
-		if len(args) < 2 {
-			return c.Send("Используй: /set [ID] [Сумма]")
-		}
-		targetID := args[0]
-		amount, _ := strconv.ParseFloat(args[1], 64)
-
-		_, err := db.Exec("UPDATE users SET balance = balance + $1 WHERE tg_id = $2", amount, targetID)
-		if err != nil {
-			return c.Send("Ошибка БД")
-		}
-		b.Send(&telebot.User{ID: AdminID}, "✅ Баланс обновлен")
-		// Уведомляем пользователя
-		tid, _ := strconv.ParseInt(targetID, 10, 64)
-		b.Send(&telebot.User{ID: tid}, fmt.Sprintf("💰 Ваш баланс изменен на %f", amount))
-		return nil
+		if c.Sender().ID != AdminID { return nil }
+		args := c.Args() // /set ID Сумма
+		if len(args) < 2 { return c.Send("Используй: /set ID Сумма") }
+		db.Exec("UPDATE users SET balance = balance + $1 WHERE tg_id = $2", args[1], args[0])
+		return c.Send("✅ Баланс изменен.")
 	})
 
-	// Команда удаления
 	b.Handle("/del", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		targetID := c.Args()[0]
-		db.Exec("DELETE FROM users WHERE tg_id = $1", targetID)
-		return c.Send("❌ Профиль удален")
+		db.Exec("DELETE FROM users WHERE tg_id = $1", c.Args()[0])
+		return c.Send("❌ Пользователь удален.")
 	})
 
-	log.Println("Бот в эфире...")
+	b.Handle("/reset", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		db.Exec("UPDATE users SET balance = 0 WHERE tg_id = $1", c.Args()[0])
+		return c.Send("🧹 Баланс обнулен.")
+	})
+
+	// Уведомление админа о запуске
+	b.Send(&telebot.User{ID: AdminID}, "🚀 Бот на Go запущен и готов к работе!")
+
+	log.Println("Бот запущен...")
 	b.Start()
 }
