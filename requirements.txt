@@ -1,5 +1,0 @@
-pyTelegramBotAPI
-psycopg2-binary
-gspread
-oauth2client
-flask
