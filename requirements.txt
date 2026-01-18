@@ -1,5 +1,5 @@
 pyTelegramBotAPI
+psycopg2-binary
 gspread
 oauth2client
 flask
-psycopg2-binary
