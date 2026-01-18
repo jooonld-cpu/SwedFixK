@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import telebot
 import gspread
 import psycopg2
@@ -10,35 +11,27 @@ from flask import Flask
 from threading import Thread
 
 # --- 1. НАСТРОЙКИ ---
+# [cite_start]Используйте ваш НОВЫЙ токен, чтобы избежать ошибки 409 [cite: 5, 39, 54]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+# Ссылка на ваш GitHub Pages
+WEB_APP_URL = "https://jooonld-cpu.github.io/SwedenFixKFront.github.io/"
+ADMIN_ID = 7631664265 
+
+# Настройки для миграции из Google Таблиц
 SHEET_NAME = os.getenv("SHEET_NAME", "SwedenFINK")
 GCP_JSON_DATA = os.getenv("GCP_JSON")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_LIST = [7631664265, 6343896085]
-NOTIFY_USER_ID = 7631664265 
 
 if GCP_JSON_DATA:
     with open("credentials.json", "w") as f:
         f.write(GCP_JSON_DATA)
 
-# --- 2. ПОДКЛЮЧЕНИЯ ---
-
-# Подключение к Google Таблицам
-def get_google_sheet():
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        gc = gspread.authorize(creds)
-        return gc.open(SHEET_NAME).sheet1
-    except: return None
-
-# Подключение к PostgreSQL
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
-
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- 3. ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ ---
+# --- 2. РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL) ---
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = get_db_connection()
@@ -55,130 +48,109 @@ def init_db():
     conn.commit()
     conn.close()
 
-@bot.message_handler(commands=['migrate'])
-def migrate_data(message):
-    if message.from_user.id not in ADMIN_LIST: return
+# --- 3. АВТОМАТИЧЕСКАЯ МИГРАЦИЯ ---
 
-    bot.send_message(message.chat.id, "⏳ Начинаю перенос данных из Google Таблиц...")
-    
-    sheet = get_google_sheet()
-    if not sheet:
-        return bot.send_message(message.chat.id, "❌ Ошибка: не удалось подключиться к Google Таблице.")
-
-    data = sheet.get_all_values()[1:] # Пропускаем заголовок
-    conn = get_db_connection()
-    
+def run_auto_migration():
     try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        gc = gspread.authorize(creds)
+        sheet = gc.open(SHEET_NAME).sheet1
+        
+        data = sheet.get_all_values()[1:]
+        conn = get_db_connection()
         with conn.cursor() as cur:
             for row in data:
-                # Вставляем данные, если tg_id уже есть — обновляем баланс и ник
                 cur.execute("""
                     INSERT INTO users (pwd, tg_id, nickname, balance, role)
                     VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (tg_id) DO UPDATE SET
                     nickname = EXCLUDED.nickname,
-                    balance = EXCLUDED.balance,
-                    role = EXCLUDED.role
+                    balance = EXCLUDED.balance
                 """, (row[0], row[1], row[2], float(row[3].replace(',', '.')), row[4]))
         conn.commit()
-        bot.send_message(message.chat.id, "✅ Данные перенесены.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка миграции: {e}")
-    finally:
         conn.close()
+        print("✅ Миграция завершена")
+    except Exception as e:
+        print(f"⚠️ Миграция пропущена или ошибка: {e}")
 
-# --- 4. ОСНОВНАЯ ЛОГИКА (БАЗА ДАННЫХ) ---
+# --- 4. ОБРАБОТЧИКИ КОМАНД ---
 
-def get_user_db(tg_id):
+@bot.message_handler(commands=['start'])
+def welcome(m):
+    uid = str(m.from_user.id)
     conn = get_db_connection()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE tg_id = %s", (str(tg_id),))
+        cur.execute("SELECT * FROM users WHERE tg_id = %s", (uid,))
         user = cur.fetchone()
     conn.close()
-    return user
 
-@bot.message_handler(commands=['start', 'profile'])
-@bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
-def show_profile(m):
-    user = get_user_db(m.from_user.id)
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    
-    if user:
-        markup.row("👤 Мой профиль", "💸 Перевод")
-        if m.from_user.id in ADMIN_LIST: markup.row("⚙️ Админ-панель")
-        
-        text = (f"👤 **{user[2]}**\n"
-                f"💰 Баланс: **{user[3]} Gold**\n"
-                f"🆔 Код: `{user[0]}`")
-        
-        kb = telebot.types.InlineKeyboardMarkup()
-        kb.row(
-            telebot.types.InlineKeyboardButton("📉 Снять Gold", callback_data="pre_withdraw"),
-            telebot.types.InlineKeyboardButton("💸 Перевод", callback_data="pre_transfer")
-        )
-        bot.send_message(m.chat.id, text, parse_mode="Markdown", reply_markup=markup)
-        bot.send_message(m.chat.id, "Действия:", reply_markup=kb)
+    if not user:
+        msg = bot.send_message(m.chat.id, "👋 Привет! Твой аккаунт не найден. Введи свой Ник для регистрации:")
+        bot.register_next_step_handler(msg, process_registration)
     else:
-        markup.row("📝 Регистрация")
-        bot.send_message(m.chat.id, "👋 Аккаунт не найден. Зарегистрируйтесь:", reply_markup=markup)
+        # Показываем кнопку открытия сайта (Web App)
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        web_info = telebot.types.WebAppInfo(WEB_APP_URL)
+        markup.add(telebot.types.KeyboardButton("💎 Личный кабинет", web_app=web_info))
+        
+        bot.send_message(m.chat.id, f"С возвращением, {user[2]}!", reply_markup=markup)
 
-# --- 5. ЛОГИКА ПЕРЕВОДА (БАЗА ДАННЫХ) ---
-
-@bot.callback_query_handler(func=lambda c: c.data == "pre_transfer")
-def transfer_callback(c):
-    msg = bot.send_message(c.message.chat.id, "Введите часть Ника для поиска:")
-    bot.register_next_step_handler(msg, search_db)
-
-def search_db(m):
-    query = f"%{m.text.lower()}%"
+def process_registration(m):
+    pwd = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     conn = get_db_connection()
     with conn.cursor() as cur:
-        cur.execute("SELECT nickname, tg_id FROM users WHERE LOWER(nickname) LIKE %s AND tg_id != %s LIMIT 8", (query, str(m.from_user.id)))
-        found = cur.fetchall()
+        cur.execute("INSERT INTO users (pwd, tg_id, nickname, balance) VALUES (%s, %s, %s, %s)",
+                    (pwd, str(m.from_user.id), m.text, 0.0))
+    conn.commit()
     conn.close()
+    bot.send_message(m.chat.id, "✅ Регистрация завершена! Нажми /start")
 
-    if not found: return bot.send_message(m.chat.id, "❌ Никто не найден.")
+# --- 5. ОБРАБОТКА ДАННЫХ ИЗ WEB APP ---
+
+@bot.message_handler(content_types=['web_app_data'])
+def handle_web_app_data(m):
+    # Получаем JSON, который отправил ваш GitHub Pages
+    data = json.loads(m.web_app_data.data)
     
-    kb = telebot.types.InlineKeyboardMarkup()
-    for nick, tid in found:
-        kb.add(telebot.types.InlineKeyboardButton(nick, callback_data=f"tr_{tid}"))
-    bot.send_message(m.chat.id, "Выберите игрока:", reply_markup=kb)
+    if data.get('action') == 'withdraw':
+        amount = data.get('amount')
+        
+        # Кнопки для админа
+        kb = telebot.types.InlineKeyboardMarkup()
+        kb.add(telebot.types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adm_ok_{m.from_user.id}_{amount}"))
+        
+        bot.send_message(ADMIN_ID, f"🚨 Заявка на снятие!\nИгрок: {m.from_user.first_name}\nСумма: {amount} Gold", reply_markup=kb)
+        bot.send_message(m.chat.id, f"⌛ Запрос на снятие {amount} Gold отправлен администрации.")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("tr_"))
-def ask_amt(c):
-    target_id = c.data.split("_")[1]
-    msg = bot.send_message(c.message.chat.id, "Сумма перевода:")
-    bot.register_next_step_handler(msg, lambda m: execute_transfer(m, target_id))
-
-def execute_transfer(m, to_id):
-    try:
-        amt = float(m.text)
-        sender = get_user_db(m.from_user.id)
-        receiver = get_user_db(to_id)
-
-        if sender[3] < amt: return bot.send_message(m.chat.id, "❌ Недостаточно Gold.")
-
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET balance = balance - %s WHERE tg_id = %s", (amt, str(m.from_user.id)))
-            cur.execute("UPDATE users SET balance = balance + %s WHERE tg_id = %s", (amt, str(to_id)))
-        conn.commit()
-        conn.close()
-
-        bot.send_message(m.chat.id, f"✅ Переведено {amt} Gold игроку {receiver[2]}.")
-        bot.send_message(to_id, f"💰 Поступил перевод от {sender[2]}: +{amt} Gold")
-    except: bot.send_message(m.chat.id, "❌ Ошибка.")
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_ok_"))
+def approve_withdraw(c):
+    _, _, uid, amt = c.data.split("_")
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE users SET balance = balance - %s WHERE tg_id = %s", (float(amt), uid))
+    conn.commit()
+    conn.close()
+    
+    bot.edit_message_text(f"✅ Выплачено {amt} Gold пользователю {uid}", c.message.chat.id, c.message.message_id)
+    bot.send_message(uid, f"✅ Твой вывод на {amt} Gold одобрен!")
 
 # --- 6. ЗАПУСК ---
 app = Flask(__name__)
 @app.route('/')
-def h(): return "OK", 200
+def health(): return "OK", 200
 
 if __name__ == "__main__":
-    init_db()
+    # [cite_start]Запуск сервера Flask для Koyeb [cite: 36, 43]
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
+    
+    init_db()
+    run_auto_migration()
+    
+    # [cite_start]Решение ошибки 409 Conflict [cite: 5, 8, 32, 39]
     bot.remove_webhook()
-    time.sleep(1)
-    try: bot.send_message(NOTIFY_USER_ID, "🚀 Бот запущен (База Данных)")
-    except: pass
+    time.sleep(2)
+    
+    print("🚀 Бот запущен (Web App Mode)")
     bot.infinity_polling(none_stop=True, skip_pending=True)
+
