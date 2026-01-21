@@ -60,13 +60,10 @@ func main() {
 
 	// --- ИНТЕГРИРОВАНО ИСПРАВЛЕНИЕ №1: НАДЕЖНАЯ ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ---
 	
-	// 1. Создаем таблицу users СРАЗУ с первичным ключом.
-	// Если таблица не создастся, бот упадет с ошибкой и мы увидим причину.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`); err != nil {
 		log.Fatal("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось создать таблицу users: ", err)
 	}
 
-	// 2. Остальные таблицы (также добавляем проверку ошибок)
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS info_line (id INT PRIMARY KEY, text TEXT)`); err != nil {
 		log.Fatal("❌ Ошибка создания info_line: ", err)
 	}
@@ -82,7 +79,6 @@ func main() {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS balances (user_id TEXT PRIMARY KEY, amount FLOAT DEFAULT 0)`); err != nil {
 		log.Fatal("❌ Ошибка создания balances: ", err)
 	}
-	// --- КОНЕЦ ИСПРАВЛЕНИЯ №1 ---
 
 	getBalance := func(uid string) float64 {
 		var a float64
@@ -221,7 +217,6 @@ func main() {
 		var ni, ro string
 		_ = db.QueryRow("SELECT nickname, role FROM users WHERE tg_id=$1", uid).Scan(&ni, &ro)
 
-		// Собираем списки для WebApp (с проверкой на nil)
 		uL := []UserShort{}
 		rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
 		if rowsU != nil {
@@ -268,7 +263,6 @@ func main() {
 
 		switch d.Action {
 		case "register":
-			// --- ИНТЕГРИРОВАНО ИСПРАВЛЕНИЕ №2: ПРАВИЛЬНЫЙ ЗАПРОС РЕГИСТРАЦИИ ---
 			query := `
 				INSERT INTO users (tg_id, nickname, role) 
 				VALUES ($1, $2, $3) 
@@ -278,12 +272,47 @@ func main() {
 			_, err := db.Exec(query, uid, d.Nick, d.Role)
 
 			if err != nil {
-				log.Println("ОШИБКА SQL ПРИ РЕГИСТРАЦИИ:", err) // Логируем ошибку для отладки
+				log.Println("ОШИБКА SQL ПРИ РЕГИСТРАЦИИ:", err)
 				return c.Send("❌ Ошибка регистрации")
 			}
-			setBalance(uid, getBalance(uid)) // Инициализация баланса если новый
-			return c.Send("✅ Данные обновлены!")
-			// --- КОНЕЦ ИСПРАВЛЕНИЯ №2 ---
+			setBalance(uid, getBalance(uid)) 
+
+			// --- НОВЫЙ ФУНКЦИОНАЛ: МГНОВЕННЫЙ ВХОД ---
+			// Пересобираем данные для URL, так как пользователь теперь "существует"
+			uL := []UserShort{}
+			rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
+			if rowsU != nil {
+				defer rowsU.Close()
+				for rowsU.Next() {
+					var u UserShort
+					rowsU.Scan(&u.ID, &u.Nick)
+					uL = append(uL, u)
+				}
+			}
+			uJ, _ := json.Marshal(uL)
+
+			mL := []MarketBond{}
+			rowsM, _ := db.Query("SELECT id, name, price, rate FROM available_bonds")
+			if rowsM != nil {
+				defer rowsM.Close()
+				for rowsM.Next() {
+					var m MarketBond
+					rowsM.Scan(&m.ID, &m.Name, &m.Price, &m.Rate)
+					mL = append(mL, m)
+				}
+			}
+			mJ, _ := json.Marshal(mL)
+
+			// Теперь exists=true, так как мы только что создали юзера
+			fURL := fmt.Sprintf("%s?tg_id=%s&exists=true&nick=%s&role=%s&bal=%.2f&users=%s&market=%s",
+				WebAppURL, uid, url.QueryEscape(d.Nick), url.QueryEscape(d.Role), getBalance(uid),
+				url.QueryEscape(string(uJ)), url.QueryEscape(string(mJ)))
+
+			menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
+			menu.Reply(menu.Row(menu.WebApp("🇸🇪 Открыть банк", &telebot.WebApp{URL: fURL})))
+
+			return c.Send("✅ Регистрация завершена! Ваш аккаунт активирован. Теперь вы можете войти в систему:", menu)
+			// --- КОНЕЦ НОВОГО ФУНКЦИОНАЛА ---
 
 		case "transfer":
 			cur := getBalance(uid)
