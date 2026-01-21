@@ -1,0 +1,10 @@
+# github.com/lib/pq v1.10.9
+## explicit; go 1.13
+github.com/lib/pq
+github.com/lib/pq/oid
+github.com/lib/pq/scram
+# github.com/stretchr/testify v1.11.1
+## explicit; go 1.17
+# gopkg.in/telebot.v3 v3.2.1
+## explicit; go 1.13
+gopkg.in/telebot.v3
