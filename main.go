@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
+	"math"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -16,141 +18,39 @@ import (
 
 const AdminID = 7631664265
 const WebAppURL = "https://jooonld-cpu.github.io/SwedenFixKFront.github.io/"
+const DefaultBankID = 1
 
-type WebAppData struct {
-	Action string  `json:"action"`
-	Nick   string  `json:"nick"`
-	Role   string  `json:"role"`
-	Target string  `json:"target_id"`
-	Type   string  `json:"type"`
-	Amount float64 `json:"amount"`
+// СТРУКТУРЫ ДАННЫХ
+type MarketBond struct {
+	ID      int     `json:"id"`
+	Name    string  `json:"name"`
+	Price   float64 `json:"price"`
+	Rate    float64 `json:"rate"`
+	MinDays int     `json:"min_days"`
 }
 
-func main() {
-	// Подключение к БД
-	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatal(err)
-	}
+type Bond struct {
+	ID           int     `json:"id"`
+	Name         string  `json:"name"`
+	Amount       float64 `json:"amount"`
+	Rate         float64 `json:"rate"`
+	CurrentValue float64 `json:"current_value"`
+	Date         string  `json:"date"`
+	CanWithdraw  bool    `json:"can_withdraw"`
+}
 
-	// Инициализация таблицы
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
-		tg_id TEXT PRIMARY KEY,
-		nickname TEXT,
-		balance FLOAT DEFAULT 0,
-		role TEXT
-	)`)
-
-	// Настройка бота
-	pref := telebot.Settings{
-		Token:  os.Getenv("BOT_TOKEN"),
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	}
-
-	b, err := telebot.NewBot(pref)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Запуск Health Check сервера для Koyeb (чтобы не было ошибки 8080)
-	go http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "OK")
-	}))
-
-	// Обработка /start
-	b.Handle("/start", func(c telebot.Context) error {
-		uid := strconv.FormatInt(c.Sender().ID, 10)
-		var nick, role string
-		var balance float64
-
-		err := db.QueryRow("SELECT nickname, balance, role FROM users WHERE tg_id=$1", uid).Scan(&nick, &balance, &role)
-		
-		exists := "true"
-		if err == sql.ErrNoRows {
-			exists = "false"
-		}
-
-		isAdmin := "false"
-		if c.Sender().ID == AdminID {
-			isAdmin = "true"
-		}
-
-		// Формируем URL для Mini App
-		finalURL := fmt.Sprintf("%s?exists=%s&admin=%s&nick=%s&role=%s&balance=%f&v=%d",
-			WebAppURL, exists, isAdmin, nick, role, balance, time.Now().Unix())
-
-		menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
-		btn := menu.WebApp("💎 Открыть Меню", &telebot.WebApp{URL: finalURL})
-		menu.Reply(menu.Row(btn))
-
-		return c.Send("Нажмите кнопку ниже, чтобы войти в кабинет или зарегистрироваться:", menu)
-	})
-
-	// Обработка данных из Web App
-	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
-		var data WebAppData
-		err := json.Unmarshal([]byte(c.Message().WebAppData.Data), &data)
-		if err != nil {
-			return nil
-		}
-
-		if data.Action == "register" {
-			uid := strconv.FormatInt(c.Sender().ID, 10)
-			_, err := db.Exec("INSERT INTO users (tg_id, nickname, role, balance) VALUES ($1, $2, $3, 0) ON CONFLICT (tg_id) DO UPDATE SET nickname=$2, role=$3",
-				uid, data.Nick, data.Role)
-			if err != nil {
-				return c.Send("Ошибка сохранения.")
-			}
-			return c.Send(fmt.Sprintf("✅ Регистрация завершена!\nНик: %s\nДолжность: %s\n\nНажми /start ещё раз.", data.Nick, data.Role))
-		}
-		return nil
-	})
-
-	// АДМИН КОМАНДЫ (текстовые)
-	b.Handle("/set", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		args := c.Args() // /set ID Сумма
-		if len(args) < 2 { return c.Send("Используй: /set ID Сумма") }
-		db.Exec("UPDATE users SET balance = balance + $1 WHERE tg_id = $2", args[1], args[0])
-		return c.Send("✅ Баланс изменен.")
-	})
-
-	b.Handle("/del", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		db.Exec("DELETE FROM users WHERE tg_id = $1", c.Args()[0])
-		return c.Send("❌ Пользователь удален.")
-	})
-
-	b.Handle("/reset", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		db.Exec("UPDATE users SET balance = 0 WHERE tg_id = $1", c.Args()[0])
-		return c.Send("🧹 Баланс обнулен.")
-	})package main
-
-import (
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"strconv"
-	"time"
-
-	_ "github.com/lib/pq"
-	"gopkg.in/telebot.v3"
-)
-
-const AdminID = 7631664265
-const WebAppURL = "https://jooonld-cpu.github.io/SwedenFixKFront.github.io/"
+type UserShort struct {
+	ID   string `json:"id"`
+	Nick string `json:"nick"`
+}
 
 type WebAppData struct {
-	Action string  `json:"action"`
-	Nick   string  `json:"nick"`
-	Role   string  `json:"role"`
-	Target string  `json:"target_id"`
-	Type   string  `json:"type"`
-	Amount float64 `json:"amount"`
+	Action   string  `json:"action"`
+	Nick     string  `json:"nick"`
+	Role     string  `json:"role"`
+	TargetID string  `json:"target_id"`
+	Amount   float64 `json:"amount"`
+	BondID   int     `json:"bond_id"`
 }
 
 func main() {
@@ -158,162 +58,250 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer db.Close()
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
-		tg_id TEXT PRIMARY KEY,
-		nickname TEXT,
-		balance FLOAT DEFAULT 0,
-		role TEXT
-	)`)
-
-	pref := telebot.Settings{
+	b, err := telebot.NewBot(telebot.Settings{
 		Token:  os.Getenv("BOT_TOKEN"),
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	}
-
-	b, err := telebot.NewBot(pref)
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	go http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "OK")
-	}))
+	// ИНИЦИАЛИЗАЦИЯ
+	db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS info_line (id INT PRIMARY KEY, text TEXT)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS bonds (id SERIAL PRIMARY KEY, user_id TEXT, name TEXT, amount FLOAT, rate FLOAT, created_at TIMESTAMP DEFAULT NOW(), can_withdraw BOOLEAN DEFAULT FALSE)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS available_bonds (id SERIAL PRIMARY KEY, name TEXT, price FLOAT, rate FLOAT, min_days INT DEFAULT 0)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS balances (user_id TEXT, bank_id INT, amount FLOAT)`)
+	
+	db.Exec(`ALTER TABLE bonds ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`)
+	db.Exec(`ALTER TABLE bonds ADD COLUMN IF NOT EXISTS can_withdraw BOOLEAN DEFAULT FALSE`)
+	db.Exec(`ALTER TABLE available_bonds ADD COLUMN IF NOT EXISTS min_days INT DEFAULT 0`)
 
-	// --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ СБОРА ДАННЫХ ---
-	generateBackup := func() (string, error) {
-		rows, err := db.Query("SELECT tg_id, nickname, balance, role FROM users")
-		if err != nil {
-			return "", err
+	var hasBankID bool
+	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'balances' AND column_name = 'bank_id')`).Scan(&hasBankID)
+
+	getBalance := func(userID string) (float64, error) {
+		var amount float64
+		var errBal error
+		if hasBankID {
+			errBal = db.QueryRow("SELECT COALESCE(amount, 0) FROM balances WHERE user_id = $1 AND bank_id = $2", userID, DefaultBankID).Scan(&amount)
+		} else {
+			errBal = db.QueryRow("SELECT COALESCE(amount, 0) FROM balances WHERE user_id = $1", userID).Scan(&amount)
 		}
-		defer rows.Close()
-
-		filePath := "db_backup.txt"
-		file, err := os.Create(filePath)
-		if err != nil {
-			return "", err
-		}
-		defer file.Close()
-
-		fmt.Fprintf(file, "Бэкап БД от %s\n", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Fprintln(file, "--------------------------------------------------")
-
-		for rows.Next() {
-			var tid, nick, role string
-			var bal float64
-			if err := rows.Scan(&tid, &nick, &bal, &role); err == nil {
-				fmt.Fprintf(file, "ID: %s | Ник: %s | Баланс: %.2f | Роль: %s\n", tid, nick, bal, role)
-			}
-		}
-		return filePath, nil
+		return amount, errBal
 	}
 
-	// --- КОМАНДА /cash_all (Только экспорт) ---
+	setBalance := func(userID string, amount float64) error {
+		var exists bool
+		if hasBankID {
+			db.QueryRow("SELECT EXISTS(SELECT 1 FROM balances WHERE user_id = $1 AND bank_id = $2)", userID, DefaultBankID).Scan(&exists)
+			if exists {
+				_, err := db.Exec("UPDATE balances SET amount = $1 WHERE user_id = $2 AND bank_id = $3", amount, userID, DefaultBankID)
+				return err
+			}
+			_, err := db.Exec("INSERT INTO balances (user_id, bank_id, amount) VALUES ($1, $2, $3)", userID, DefaultBankID, amount)
+			return err
+		}
+		db.QueryRow("SELECT EXISTS(SELECT 1 FROM balances WHERE user_id = $1)", userID).Scan(&exists)
+		if exists {
+			_, err := db.Exec("UPDATE balances SET amount = $1 WHERE user_id = $2", amount, userID)
+			return err
+		}
+		_, err := db.Exec("INSERT INTO balances (user_id, amount) VALUES ($1, $2)", userID, amount)
+		return err
+	}
+
+	calcBond := func(amount, rate float64, createdAt time.Time) float64 {
+		if createdAt.Year() < 2024 { return amount }
+		days := math.Floor(time.Since(createdAt).Hours() / 24)
+		if days <= 0 { return amount }
+		if days > 365 { days = 365 } 
+		res := amount * math.Pow(1+(rate/100), days)
+		if math.IsInf(res, 0) || math.IsNaN(res) { return amount }
+		return res
+	}
+
+	// CALLBACK ОБРАБОТЧИКИ
+	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		data := c.Callback().Data
+		if strings.Contains(data, "approve") {
+			parts := strings.Split(data, ":")
+			if len(parts) < 3 { return c.Respond() }
+			targetID := parts[1]
+			amount, _ := strconv.ParseFloat(parts[2], 64)
+			cur, _ := getBalance(targetID)
+			setBalance(targetID, cur-amount)
+			tID, _ := strconv.ParseInt(targetID, 10, 64)
+			b.Send(&telebot.User{ID: tID}, fmt.Sprintf("✅ Вывод одобрен: %.2f GOLD.", amount))
+			c.Edit(fmt.Sprintf("✅ ОДОБРЕНО\n💰 Сумма: %.2f", amount))
+			return c.Respond()
+		}
+		if strings.Contains(data, "reject") {
+			parts := strings.Split(data, ":")
+			tID, _ := strconv.ParseInt(parts[1], 10, 64)
+			b.Send(&telebot.User{ID: tID}, "❌ Вывод отклонен.")
+			c.Edit("❌ ОТКЛОНЕНО")
+			return c.Respond()
+		}
+		return c.Respond()
+	})
+
+	// --- АДМИН КОМАНДЫ ---
+
 	b.Handle("/cash_all", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-
-		path, err := generateBackup()
-		if err != nil {
-			return c.Send("Ошибка генерации файла: " + err.Error())
+		rows, _ := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
+		defer rows.Close()
+		var res strings.Builder
+		res.WriteString("💰 **БАЛАНСЫ:**\n\n")
+		for rows.Next() {
+			var n string; var a float64
+			rows.Scan(&n, &a); res.WriteString(fmt.Sprintf("%s: %.2f GOLD\n", n, a))
 		}
-		defer os.Remove(path)
-
-		doc := &telebot.Document{File: telebot.FromDisk(path), FileName: "Full_DB_Backup.txt"}
-		return c.Send(doc)
+		return c.Send(res.String(), telebot.ModeMarkdown)
 	})
 
-	// --- КОМАНДА /clear_all (Экспорт + Удаление с подтверждением) ---
-	confirmMenu := &telebot.ReplyMarkup{}
-	btnConfirm := confirmMenu.Data("⚠️ ПОДТВЕРДИТЬ УДАЛЕНИЕ", "confirm_delete_all")
-
-	b.Handle("/clear_all", func(c telebot.Context) error {
+	b.Handle("/cash_all_file", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		confirmMenu.Inline(confirmMenu.Row(btnConfirm))
-		return c.Send("Вы собираетесь полностью очистить базу данных. Бэкап будет создан автоматически. Продолжить?", confirmMenu)
+		rows, _ := db.Query("SELECT user_id, amount FROM balances")
+		defer rows.Close()
+		txt := "ID | BALANCE\n"
+		for rows.Next() {
+			var id string; var a float64
+			rows.Scan(&id, &a); txt += fmt.Sprintf("%s | %.2f\n", id, a)
+		}
+		os.WriteFile("balances.txt", []byte(txt), 0644)
+		defer os.Remove("balances.txt")
+		return c.Send(&telebot.Document{File: telebot.FromDisk("balances.txt")})
 	})
 
-	b.Handle(&btnConfirm, func(c telebot.Context) error {
+	b.Handle("/add_user", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-
-		// 1. Делаем бэкап
-		path, err := generateBackup()
-		if err == nil {
-			doc := &telebot.Document{File: telebot.FromDisk(path), FileName: "Backup_Before_Wipe.txt"}
-			c.Send("Копия перед удалением:", doc)
-			os.Remove(path)
-		}
-
-		// 2. Очищаем таблицу
-		_, err = db.Exec("DELETE FROM users")
-		if err != nil {
-			return c.Edit("Ошибка при удалении: " + err.Error())
-		}
-
-		return c.Edit("✅ База данных успешно очищена. Все данные удалены.")
+		a := c.Args()
+		if len(a) < 3 { return c.Send("⚠️ /add_user [ID] [NICK] [ROLE]") }
+		db.Exec("INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3) ON CONFLICT (tg_id) DO UPDATE SET nickname=$2, role=$3", a[0], a[1], a[2])
+		setBalance(a[0], 0)
+		return c.Send("✅ Готово.")
 	})
 
-	// --- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ---
+	b.Handle("/del_user", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		if len(c.Args()) < 1 { return c.Send("ID?") }
+		db.Exec("DELETE FROM users WHERE tg_id=$1", c.Args()[0])
+		return c.Send("🗑 Удален.")
+	})
+
+	b.Handle("/deposit", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		a := c.Args()
+		if len(a) < 2 { return c.Send("ID SUMMA?") }
+		v, _ := strconv.ParseFloat(a[1], 64)
+		cur, _ := getBalance(a[0])
+		setBalance(a[0], cur+v)
+		return c.Send("✅")
+	})
+
+	// --- МЕНЮ START ---
+
 	b.Handle("/start", func(c telebot.Context) error {
 		uid := strconv.FormatInt(c.Sender().ID, 10)
-		var nick, role string
-		var balance float64
+		var ni, ro string
+		db.QueryRow("SELECT nickname, role FROM users WHERE tg_id=$1", uid).Scan(&ni, &ro)
 
-		err := db.QueryRow("SELECT nickname, balance, role FROM users WHERE tg_id=$1", uid).Scan(&nick, &balance, &role)
-		
-		exists := "true"
-		if err == sql.ErrNoRows { exists = "false" }
+		// Данные для WebApp
+		rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
+		var uL []UserShort
+		for rowsU != nil && rowsU.Next() {
+			var u UserShort; rowsU.Scan(&u.ID, &u.Nick); uL = append(uL, u)
+		}
+		uJ, _ := json.Marshal(uL)
 
-		isAdmin := "false"
-		if c.Sender().ID == AdminID { isAdmin = "true" }
+		qB := `SELECT id, name, amount, rate, CAST(created_at AS TIMESTAMP), can_withdraw FROM bonds WHERE user_id=$1`
+		rowsB, _ := db.Query(qB, uid)
+		var userBonds []Bond
+		for rowsB != nil && rowsB.Next() {
+			var bo Bond; var t time.Time
+			rowsB.Scan(&bo.ID, &bo.Name, &bo.Amount, &bo.Rate, &t, &bo.CanWithdraw)
+			bo.CurrentValue = calcBond(bo.Amount, bo.Rate, t)
+			bo.Date = t.Format("02.01.2006")
+			userBonds = append(userBonds, bo)
+		}
+		bJ, _ := json.Marshal(userBonds)
 
-		finalURL := fmt.Sprintf("%s?exists=%s&admin=%s&nick=%s&role=%s&balance=%f&v=%d",
-			WebAppURL, exists, isAdmin, nick, role, balance, time.Now().Unix())
+		rowsM, _ := db.Query("SELECT id, name, price, rate, min_days FROM available_bonds")
+		var marketBonds []MarketBond
+		for rowsM != nil && rowsM.Next() {
+			var mb MarketBond; rowsM.Scan(&mb.ID, &mb.Name, &mb.Price, &mb.Rate, &mb.MinDays); marketBonds = append(marketBonds, mb)
+		}
+		mJ, _ := json.Marshal(marketBonds)
+
+		ba, _ := getBalance(uid)
+		var inf string; db.QueryRow("SELECT text FROM info_line WHERE id=1").Scan(&inf)
+
+		// ПЕРЕДАЕМ ПАРАМЕТРЫ НА САЙТ (включая флаг для кнопки справочника, если нужно)
+		fURL := fmt.Sprintf("%s?tg_id=%s&exists=%t&nick=%s&role=%s&bal=%.2f&info=%s&users=%s&bonds=%s&market=%s",
+			WebAppURL, uid, ni != "", url.QueryEscape(ni), url.QueryEscape(ro), ba, url.QueryEscape(inf), url.QueryEscape(string(uJ)), url.QueryEscape(string(bJ)), url.QueryEscape(string(mJ)))
 
 		menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
-		btn := menu.WebApp("💎 Открыть Меню", &telebot.WebApp{URL: finalURL})
-		menu.Reply(menu.Row(btn))
-
-		return c.Send("Нажмите кнопку ниже, чтобы войти в кабинет или зарегистрироваться:", menu)
+		menu.Reply(menu.Row(menu.WebApp("🇸🇪 Кабинет", &telebot.WebApp{URL: fURL})))
+		
+		return c.Send("🇸🇪 Система активна.", menu)
 	})
 
+	// --- ЛОГИКА WEBAPP ---
 	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
-		var data WebAppData
-		err := json.Unmarshal([]byte(c.Message().WebAppData.Data), &data)
-		if err != nil { return nil }
+		var d WebAppData
+		json.Unmarshal([]byte(c.Message().WebAppData.Data), &d)
+		uid := strconv.FormatInt(c.Sender().ID, 10)
 
-		if data.Action == "register" {
-			uid := strconv.FormatInt(c.Sender().ID, 10)
-			_, err := db.Exec("INSERT INTO users (tg_id, nickname, role, balance) VALUES ($1, $2, $3, 0) ON CONFLICT (tg_id) DO UPDATE SET nickname=$2, role=$3",
-				uid, data.Nick, data.Role)
-			if err != nil { return c.Send("Ошибка сохранения.") }
-			return c.Send(fmt.Sprintf("✅ Регистрация завершена!\nНик: %s\nДолжность: %s\n\nНажми /start ещё раз.", data.Nick, data.Role))
+		switch d.Action {
+		case "buy_bond":
+			var mb MarketBond
+			db.QueryRow("SELECT name, price, rate FROM available_bonds WHERE id=$1", d.BondID).Scan(&mb.Name, &mb.Price, &mb.Rate)
+			uBal, _ := getBalance(uid)
+			if uBal < d.Amount { return c.Send("❌ Недостаточно GOLD.") }
+			setBalance(uid, uBal-d.Amount)
+			db.Exec("INSERT INTO bonds (user_id, name, amount, rate, created_at) VALUES ($1, $2, $3, $4, NOW())", uid, mb.Name, d.Amount, mb.Rate)
+			return c.Send("✅ Куплено!")
+
+		case "sell_bond":
+			var am, rt float64; var t time.Time; var cw bool
+			db.QueryRow("SELECT amount, rate, created_at, can_withdraw FROM bonds WHERE id=$1", d.BondID).Scan(&am, &rt, &t, &cw)
+			if !cw { return c.Send("🔒 Заморожено.") }
+			val := calcBond(am, rt, t)
+			uB, _ := getBalance(uid)
+			setBalance(uid, uB+val)
+			db.Exec("DELETE FROM bonds WHERE id=$1", d.BondID)
+			return c.Send("💰 Продано.")
+
+		case "withdraw":
+			m := &telebot.ReplyMarkup{}
+			bA := m.Data("✅", "approve", fmt.Sprintf("approve:%s:%.2f", uid, d.Amount))
+			bR := m.Data("❌", "reject", fmt.Sprintf("reject:%s", uid))
+			m.Inline(m.Row(bA, bR))
+			b.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС: %s | %.2f", d.Nick, d.Amount), m)
+			return c.Send("✅ Ожидайте.")
+
+		case "register":
+			db.Exec("INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3)", uid, d.Nick, d.Role)
+			setBalance(uid, 0)
+			return c.Send("✅ Регистрация.")
+
+		case "transfer":
+			sB, _ := getBalance(uid)
+			if sB < d.Amount { return c.Send("❌") }
+			rB, _ := getBalance(d.TargetID)
+			setBalance(uid, sB-d.Amount)
+			setBalance(d.TargetID, rB+d.Amount)
+			tID, _ := strconv.ParseInt(d.TargetID, 10, 64)
+			b.Send(&telebot.User{ID: tID}, fmt.Sprintf("💰 +%.2f от %s", d.Amount, d.Nick))
+			return c.Send("✅")
 		}
 		return nil
 	})
 
-	b.Handle("/set", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		args := c.Args()
-		if len(args) < 2 { return c.Send("Используй: /set ID Сумма") }
-		db.Exec("UPDATE users SET balance = balance + $1 WHERE tg_id = $2", args[1], args[0])
-		return c.Send("✅ Баланс изменен.")
-	})
-
-	b.Handle("/del", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		if len(c.Args()) < 1 { return c.Send("Укажите ID") }
-		db.Exec("DELETE FROM users WHERE tg_id = $1", c.Args()[0])
-		return c.Send("❌ Пользователь удален.")
-	})
-
-	b.Handle("/reset", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		if len(c.Args()) < 1 { return c.Send("Укажите ID") }
-		db.Exec("UPDATE users SET balance = 0 WHERE tg_id = $1", c.Args()[0])
-		return c.Send("🧹 Баланс обнулен.")
-	})
-
-	b.Send(&telebot.User{ID: AdminID}, "🚀 Бот на Go запущен и готов к работе!")
-	log.Println("Бот запущен...")
+	log.Println("🚀 Бот запущен!")
 	b.Start()
 }
