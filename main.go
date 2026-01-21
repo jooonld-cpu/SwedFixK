@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http" // Добавлено
 	"net/url"
 	"os"
 	"strconv"
@@ -54,6 +55,22 @@ type WebAppData struct {
 }
 
 func main() {
+	// --- ДОБАВЛЕННЫЙ HTTP БЛОК ДЛЯ RENDER ---
+	go func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "Бот Швеции активен!")
+		})
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		log.Println("🌍 HTTP Сервер запущен на порту " + port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	// ----------------------------------------
+
 	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
@@ -218,7 +235,7 @@ func main() {
 		}
 		uJ, _ := json.Marshal(uL)
 
-		qB := `SELECT id, name, amount, rate, CAST(created_at AS TIMESTAMP), can_withdraw FROM bonds WHERE user_id=$1`
+		qB := `SELECT id, name, amount, rate, created_at, can_withdraw FROM bonds WHERE user_id=$1`
 		rowsB, _ := db.Query(qB, uid)
 		var userBonds []Bond
 		for rowsB != nil && rowsB.Next() {
@@ -302,6 +319,9 @@ func main() {
 		return nil
 	})
 
+	log.Println("🚀 Бот запущен!")
+	b.Start()
+}
 	log.Println("🚀 Бот запущен!")
 	b.Start()
 }
