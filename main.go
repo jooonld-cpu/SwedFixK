@@ -55,31 +55,36 @@ type WebAppData struct {
 }
 
 func main() {
-	// ИСПРАВЛЕНИЕ ПОДКЛЮЧЕНИЯ: используем формат параметров вместо URL ссылки,
-	// чтобы спецсимволы в пароле ([, ], +, /) не ломали запуск.
-	rawURL := os.Getenv("DATABASE_URL")
+	// ИСПРАВЛЕНИЕ ПОДКЛЮЧЕНИЯ: 
+	// Мы проверяем наличие отдельных переменных для БД (хост, пароль и т.д.).
+	// Это самый надежный способ избежать ошибок со спецсимволами вроде [ ] + / в пароле.
 	var db *sql.DB
 	var err error
 
-	if strings.HasPrefix(rawURL, "postgres://") || strings.HasPrefix(rawURL, "postgresql://") {
-		// Пытаемся распарсить URL, чтобы вытащить пароль и хост отдельно
-		u, err := url.Parse(rawURL)
-		if err == nil {
-			pass, _ := u.User.Password()
-			host := u.Host
-			user := u.User.Username()
-			dbname := strings.TrimPrefix(u.Path, "/")
-			
-			// Формируем безопасную строку подключения
-			dsn := fmt.Sprintf("host=%s user=%s password='%s' dbname=%s sslmode=require", 
-				host, user, pass, dbname)
-			db, err = sql.Open("postgres", dsn)
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost != "" {
+		// Собираем DSN формат. Одинарные кавычки вокруг пароля позволяют использовать любые символы.
+		dsn := fmt.Sprintf("host=%s port=5432 user=%s password='%s' dbname=%s sslmode=require",
+			dbHost, os.Getenv("DB_USER"), os.Getenv("DB_PASS"), os.Getenv("DB_NAME"))
+		db, err = sql.Open("postgres", dsn)
+	} else {
+		// Если переменных нет, пытаемся обработать DATABASE_URL
+		rawURL := os.Getenv("DATABASE_URL")
+		if strings.HasPrefix(rawURL, "postgres://") || strings.HasPrefix(rawURL, "postgresql://") {
+			u, parseErr := url.Parse(rawURL)
+			if parseErr == nil {
+				pass, _ := u.User.Password()
+				host := u.Host
+				user := u.User.Username()
+				dbname := strings.TrimPrefix(u.Path, "/")
+				dsn := fmt.Sprintf("host=%s user=%s password='%s' dbname=%s sslmode=require", 
+					host, user, pass, dbname)
+				db, err = sql.Open("postgres", dsn)
+			}
 		}
-	}
-
-	// Если через DSN не вышло или URL был другой — пробуем обычный метод
-	if db == nil {
-		db, err = sql.Open("postgres", rawURL)
+		if db == nil {
+			db, err = sql.Open("postgres", rawURL)
+		}
 	}
 
 	if err != nil {
@@ -213,10 +218,10 @@ func main() {
 	// АДМИН КОМАНДЫ
 	b.Handle("/set_info", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		// Используем Payload, но добавляем проверку на пробелы
+		
+		// Исправлено: Сначала пробуем Payload, если пусто — берем все аргументы через Join
 		txt := strings.TrimSpace(c.Message().Payload)
 		if txt == "" {
-			// Если Payload пустой, пробуем взять аргументы через strings.Join
 			if len(c.Args()) > 0 {
 				txt = strings.Join(c.Args(), " ")
 			}
