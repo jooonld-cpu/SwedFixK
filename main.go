@@ -322,6 +322,3 @@ func main() {
 	log.Println("🚀 Бот запущен!")
 	b.Start()
 }
-	log.Println("🚀 Бот запущен!")
-	b.Start()
-}
