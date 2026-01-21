@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"net/http" // Добавлено
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -55,37 +55,13 @@ type WebAppData struct {
 }
 
 func main() {
-	// --- ДОБАВЛЕННЫЙ HTTP БЛОК ДЛЯ RENDER ---
-	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, "Бот Швеции активен!")
-		})
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
-		}
-		log.Println("🌍 HTTP Сервер запущен на порту " + port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
-			log.Fatal(err)
-		}
-	}()
-	// ----------------------------------------
-
 	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	b, err := telebot.NewBot(telebot.Settings{
-		Token:  os.Getenv("BOT_TOKEN"),
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// ИНИЦИАЛИЗАЦИЯ
+	// 1. ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ (Сначала создаем всё)
 	db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS info_line (id INT PRIMARY KEY, text TEXT)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS bonds (id SERIAL PRIMARY KEY, user_id TEXT, name TEXT, amount FLOAT, rate FLOAT, created_at TIMESTAMP DEFAULT NOW(), can_withdraw BOOLEAN DEFAULT FALSE)`)
@@ -99,6 +75,7 @@ func main() {
 	var hasBankID bool
 	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'balances' AND column_name = 'bank_id')`).Scan(&hasBankID)
 
+	// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 	getBalance := func(userID string) (float64, error) {
 		var amount float64
 		var errBal error
@@ -140,7 +117,51 @@ func main() {
 		return res
 	}
 
-	// CALLBACK ОБРАБОТЧИКИ
+	// 3. HTTP БЛОК ДЛЯ RENDER + API (Теперь функции определены и доступны)
+	go func() {
+		http.HandleFunc("/api/get_user_data", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			uid := r.URL.Query().Get("uid")
+			if uid == "" { return }
+
+			bal, _ := getBalance(uid)
+
+			rowsB, _ := db.Query(`SELECT id, name, amount, rate, created_at, can_withdraw FROM bonds WHERE user_id=$1`, uid)
+			var userBonds []Bond
+			if rowsB != nil {
+				for rowsB.Next() {
+					var bo Bond; var t time.Time
+					rowsB.Scan(&bo.ID, &bo.Name, &bo.Amount, &bo.Rate, &t, &bo.CanWithdraw)
+					bo.CurrentValue = calcBond(bo.Amount, bo.Rate, t)
+					bo.Date = t.Format("02.01.2006")
+					userBonds = append(userBonds, bo)
+				}
+				rowsB.Close()
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"balance": bal,
+				"bonds":   userBonds,
+			})
+		})
+
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "Бот Швеции активен!")
+		})
+
+		port := os.Getenv("PORT")
+		if port == "" { port = "8080" }
+		http.ListenAndServe(":"+port, nil)
+	}()
+
+	// 4. НАСТРОЙКА БОТА
+	b, err := telebot.NewBot(telebot.Settings{
+		Token:  os.Getenv("BOT_TOKEN"),
+		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
+	})
+	if err != nil { log.Fatal(err) }
+
+	// CALLBACK-И
 	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
 		data := c.Callback().Data
 		if strings.Contains(data, "approve") {
@@ -165,11 +186,11 @@ func main() {
 		return c.Respond()
 	})
 
-	// --- АДМИН КОМАНДЫ ---
-
+	// АДМИН КОМАНДЫ (ИСПРАВЛЕНО)
 	b.Handle("/cash_all", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		rows, _ := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
+		rows, err := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
+		if err != nil { return c.Send("Ошибка БД") }
 		defer rows.Close()
 		var res strings.Builder
 		res.WriteString("💰 **БАЛАНСЫ:**\n\n")
@@ -220,14 +241,12 @@ func main() {
 		return c.Send("✅")
 	})
 
-	// --- МЕНЮ START ---
-
+	// /START (ИСПРАВЛЕНО)
 	b.Handle("/start", func(c telebot.Context) error {
 		uid := strconv.FormatInt(c.Sender().ID, 10)
 		var ni, ro string
 		db.QueryRow("SELECT nickname, role FROM users WHERE tg_id=$1", uid).Scan(&ni, &ro)
 
-		// Данные для WebApp
 		rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
 		var uL []UserShort
 		for rowsU != nil && rowsU.Next() {
@@ -257,7 +276,6 @@ func main() {
 		ba, _ := getBalance(uid)
 		var inf string; db.QueryRow("SELECT text FROM info_line WHERE id=1").Scan(&inf)
 
-		// ПЕРЕДАЕМ ПАРАМЕТРЫ НА САЙТ (включая флаг для кнопки справочника, если нужно)
 		fURL := fmt.Sprintf("%s?tg_id=%s&exists=%t&nick=%s&role=%s&bal=%.2f&info=%s&users=%s&bonds=%s&market=%s",
 			WebAppURL, uid, ni != "", url.QueryEscape(ni), url.QueryEscape(ro), ba, url.QueryEscape(inf), url.QueryEscape(string(uJ)), url.QueryEscape(string(bJ)), url.QueryEscape(string(mJ)))
 
@@ -267,7 +285,7 @@ func main() {
 		return c.Send("🇸🇪 Система активна.", menu)
 	})
 
-	// --- ЛОГИКА WEBAPP ---
+	// WEBAPP LOGIC
 	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
 		var d WebAppData
 		json.Unmarshal([]byte(c.Message().WebAppData.Data), &d)
