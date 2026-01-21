@@ -225,7 +225,7 @@ func main() {
 			setBalance(targetID, cur-amount)
 			tID, _ := strconv.ParseInt(targetID, 10, 64)
 
-			bot.Send(&telebot.User{ID: tID}, fmt.Sprintf("✅ Вывод одобрен!\n💰 Сумма: %.2f GOLD списано с вашего баланса.", amount))
+			_, _ = bot.Send(&telebot.User{ID: tID}, fmt.Sprintf("✅ Вывод одобрен!\n💰 Сумма: %.2f GOLD списано с вашего баланса.", amount))
 
 			c.Edit(fmt.Sprintf("✅ ОДОБРЕНО\n👤 ID: %s\n💰 Сумма: %.2f GOLD", targetID, amount))
 			c.Respond(&telebot.CallbackResponse{Text: "✅ Выполнено"})
@@ -242,7 +242,7 @@ func main() {
 			targetID := parts[1]
 			tID, _ := strconv.ParseInt(targetID, 10, 64)
 
-			bot.Send(&telebot.User{ID: tID}, "❌ Ваш запрос на вывод средств был отклонен администрацией.")
+			_, _ = bot.Send(&telebot.User{ID: tID}, "❌ Ваш запрос на вывод средств был отклонен администрацией.")
 
 			c.Edit("❌ ОТКЛОНЕНО")
 			c.Respond(&telebot.CallbackResponse{Text: "❌ Отклонено"})
@@ -288,7 +288,8 @@ func main() {
 			var uid string
 			rows.Scan(&uid)
 			tID, _ := strconv.ParseInt(uid, 10, 64)
-			if err := bot.Send(&telebot.User{ID: tID}, "📢 ОБЪЯВЛЕНИЕ ОТ АДМИНИСТРАЦИИ:\n\n"+msg); err == nil {
+			// ИСПРАВЛЕНИЕ: Добавлен пустой идентификатор _, чтобы принять Message
+			if _, err := bot.Send(&telebot.User{ID: tID}, "📢 ОБЪЯВЛЕНИЕ ОТ АДМИНИСТРАЦИИ:\n\n"+msg); err == nil {
 				count++
 			}
 			time.Sleep(50 * time.Millisecond)
@@ -312,7 +313,7 @@ func main() {
 		}
 
 		tID, _ := strconv.ParseInt(args[0], 10, 64)
-		bot.Send(&telebot.User{ID: tID}, "🚫 Вы были заблокированы администрацией. Доступ к системе ограничен.")
+		_, _ = bot.Send(&telebot.User{ID: tID}, "🚫 Вы были заблокированы администрацией. Доступ к системе ограничен.")
 
 		return c.Send(fmt.Sprintf("✅ Пользователь %s заблокирован", args[0]))
 	})
@@ -332,7 +333,7 @@ func main() {
 		}
 
 		tID, _ := strconv.ParseInt(args[0], 10, 64)
-		bot.Send(&telebot.User{ID: tID}, "✅ Ваша блокировка снята! Доступ к системе восстановлен.")
+		_, _ = bot.Send(&telebot.User{ID: tID}, "✅ Ваша блокировка снята! Доступ к системе восстановлен.")
 
 		return c.Send(fmt.Sprintf("✅ Пользователь %s разблокирован", args[0]))
 	})
@@ -436,7 +437,7 @@ func main() {
 		}
 
 		fileName := "balances.txt"
-		os.WriteFile(fileName, []byte(content), 0644)
+		_ = os.WriteFile(fileName, []byte(content), 0644)
 		return c.Send(&telebot.Document{File: telebot.FromDisk(fileName), FileName: fileName})
 	})
 
@@ -563,7 +564,7 @@ func main() {
 			setBalance(uid, getBalance(uid)-d.Amount)
 			db.Exec("INSERT INTO bonds (user_id, name, amount, rate) VALUES ($1, $2, $3, $4)", uid, name, d.Amount, rate)
 
-			bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("📈 НОВАЯ ИНВЕСТИЦИЯ\n👤 Игрок: %s\n💰 Сумма: %.2f GOLD\n📊 Облигация: %s\n📈 Процент: %.2f%%\n📅 Дата: %s",
+			_, _ = bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("📈 НОВАЯ ИНВЕСТИЦИЯ\n👤 Игрок: %s\n💰 Сумма: %.2f GOLD\n📊 Облигация: %s\n📈 Процент: %.2f%%\n📅 Дата: %s",
 				d.Nick, d.Amount, name, rate, time.Now().Format("02.01.2006 15:04")))
 
 			return c.Send(fmt.Sprintf("✅ Вы инвестировали %.2f GOLD в %s", d.Amount, name))
@@ -604,7 +605,7 @@ func main() {
 
 			targetIDInt, err := strconv.ParseInt(d.TargetID, 10, 64)
 			if err == nil {
-				bot.Send(&telebot.User{ID: targetIDInt}, fmt.Sprintf("💰 Вам поступил перевод!\n👤 От: %s\n💵 Сумма: %.2f GOLD", senderNick, d.Amount))
+				_, _ = bot.Send(&telebot.User{ID: targetIDInt}, fmt.Sprintf("💰 Вам поступил перевод!\n👤 От: %s\n💵 Сумма: %.2f GOLD", senderNick, d.Amount))
 			}
 
 			return c.Send(fmt.Sprintf("✅ Перевод выполнен успешно!\n👤 Получатель: %s\n💸 Сумма: %.2f GOLD", receiverNick, d.Amount))
@@ -615,7 +616,7 @@ func main() {
 			btnReject := markup.Data("❌ Отклонить", "reject", fmt.Sprintf("reject:%s", uid))
 			markup.Inline(markup.Row(btnApprove, btnReject))
 
-			bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС НА ВЫВОД\n👤 От: %s (ID: %s)\n💰 Сумма: %.2f GOLD", d.Nick, uid, d.Amount), markup)
+			_, _ = bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС НА ВЫВОД\n👤 От: %s (ID: %s)\n💰 Сумма: %.2f GOLD", d.Nick, uid, d.Amount), markup)
 			return c.Send("✅ Ваш запрос на вывод средств отправлен на проверку администратору.")
 
 		case "complaint":
@@ -633,7 +634,7 @@ func main() {
 
 			db.Exec("INSERT INTO complaints (user_id, nickname, complaint) VALUES ($1, $2, $3)", uid, d.Nick, d.Complaint)
 
-			bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("📋 НОВАЯ ЖАЛОБА\n👤 От: %s (ID: %s)\n📅 Время: %s\n\n💬 Жалоба:\n%s",
+			_, _ = bot.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("📋 НОВАЯ ЖАЛОБА\n👤 От: %s (ID: %s)\n📅 Время: %s\n\n💬 Жалоба:\n%s",
 				d.Nick, uid, time.Now().Format("02.01.2006 15:04"), d.Complaint))
 
 			return c.Send("✅ Ваша жалоба отправлена администрации. Ожидайте ответа.")
