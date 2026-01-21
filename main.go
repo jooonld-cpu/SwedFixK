@@ -55,13 +55,44 @@ type WebAppData struct {
 }
 
 func main() {
-	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	// ИСПРАВЛЕНИЕ ПОДКЛЮЧЕНИЯ: используем формат параметров вместо URL ссылки,
+	// чтобы спецсимволы в пароле ([, ], +, /) не ломали запуск.
+	rawURL := os.Getenv("DATABASE_URL")
+	var db *sql.DB
+	var err error
+
+	if strings.HasPrefix(rawURL, "postgres://") || strings.HasPrefix(rawURL, "postgresql://") {
+		// Пытаемся распарсить URL, чтобы вытащить пароль и хост отдельно
+		u, err := url.Parse(rawURL)
+		if err == nil {
+			pass, _ := u.User.Password()
+			host := u.Host
+			user := u.User.Username()
+			dbname := strings.TrimPrefix(u.Path, "/")
+			
+			// Формируем безопасную строку подключения
+			dsn := fmt.Sprintf("host=%s user=%s password='%s' dbname=%s sslmode=require", 
+				host, user, pass, dbname)
+			db, err = sql.Open("postgres", dsn)
+		}
+	}
+
+	// Если через DSN не вышло или URL был другой — пробуем обычный метод
+	if db == nil {
+		db, err = sql.Open("postgres", rawURL)
+	}
+
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("❌ Ошибка открытия БД:", err)
 	}
 	defer db.Close()
 
-	// 1. ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ (Сначала создаем всё)
+	// Проверка соединения
+	if err := db.Ping(); err != nil {
+		log.Println("❌ БД недоступна (проверьте пароль):", err)
+	}
+
+	// 1. ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ
 	db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS info_line (id INT PRIMARY KEY, text TEXT)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS bonds (id SERIAL PRIMARY KEY, user_id TEXT, name TEXT, amount FLOAT, rate FLOAT, created_at TIMESTAMP DEFAULT NOW(), can_withdraw BOOLEAN DEFAULT FALSE)`)
@@ -74,6 +105,7 @@ func main() {
 
 	var hasBankID bool
 	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'balances' AND column_name = 'bank_id')`).Scan(&hasBankID)
+	log.Printf("✅ Инициализация: bank_id=%v", hasBankID)
 
 	// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 	getBalance := func(userID string) (float64, error) {
@@ -117,18 +149,17 @@ func main() {
 		return res
 	}
 
-	// 3. HTTP БЛОК ДЛЯ RENDER + API (Теперь функции определены и доступны)
+	// 3. HTTP БЛОК ДЛЯ RENDER + API
 	go func() {
 		http.HandleFunc("/api/get_user_data", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			uid := r.URL.Query().Get("uid")
 			if uid == "" { return }
-
 			bal, _ := getBalance(uid)
-
 			rowsB, _ := db.Query(`SELECT id, name, amount, rate, created_at, can_withdraw FROM bonds WHERE user_id=$1`, uid)
 			var userBonds []Bond
 			if rowsB != nil {
+				defer rowsB.Close()
 				for rowsB.Next() {
 					var bo Bond; var t time.Time
 					rowsB.Scan(&bo.ID, &bo.Name, &bo.Amount, &bo.Rate, &t, &bo.CanWithdraw)
@@ -136,19 +167,12 @@ func main() {
 					bo.Date = t.Format("02.01.2006")
 					userBonds = append(userBonds, bo)
 				}
-				rowsB.Close()
 			}
-
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"balance": bal,
-				"bonds":   userBonds,
-			})
+			json.NewEncoder(w).Encode(map[string]interface{}{"balance": bal, "bonds": userBonds})
 		})
-
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "Бот Швеции активен!")
 		})
-
 		port := os.Getenv("PORT")
 		if port == "" { port = "8080" }
 		http.ListenAndServe(":"+port, nil)
@@ -186,11 +210,75 @@ func main() {
 		return c.Respond()
 	})
 
-	// АДМИН КОМАНДЫ (ИСПРАВЛЕНО)
+	// АДМИН КОМАНДЫ
+	b.Handle("/set_info", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		// Используем Payload, но добавляем проверку на пробелы
+		txt := strings.TrimSpace(c.Message().Payload)
+		if txt == "" {
+			// Если Payload пустой, пробуем взять аргументы через strings.Join
+			if len(c.Args()) > 0 {
+				txt = strings.Join(c.Args(), " ")
+			}
+		}
+
+		if txt == "" {
+			return c.Send("⚠️ Напишите текст: /set_info Новости дня...")
+		}
+		_, err := db.Exec("INSERT INTO info_line (id, text) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET text = $1", txt)
+		if err != nil {
+			return c.Send("❌ Ошибка БД: " + err.Error())
+		}
+		return c.Send("✅ Инфо-линия обновлена!")
+	})
+
+	b.Handle("/create_bond", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		a := c.Args()
+		if len(a) < 4 { return c.Send("⚠️ /create_bond [Имя] [Цена] [Процент] [Дни]") }
+		p, _ := strconv.ParseFloat(a[1], 64)
+		r, _ := strconv.ParseFloat(a[2], 64)
+		d, _ := strconv.Atoi(a[3])
+		db.Exec("INSERT INTO available_bonds (name, price, rate, min_days) VALUES ($1, $2, $3, $4)", a[0], p, r, d)
+		return c.Send("✅ Товар добавлен в магазин.")
+	})
+
+	b.Handle("/del_bond", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		if len(c.Args()) < 1 { return c.Send("ID товара?") }
+		db.Exec("DELETE FROM available_bonds WHERE id = $1", c.Args()[0])
+		return c.Send("🗑 Товар удален.")
+	})
+
+	b.Handle("/set_lock", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		a := c.Args()
+		if len(a) < 2 { return c.Send("⚠️ /set_lock [ID_ВКЛАДА] [1/0]") }
+		val := a[1] == "1"
+		db.Exec("UPDATE bonds SET can_withdraw = $1 WHERE id = $2", val, a[0])
+		return c.Send("✅ Статус вклада изменен.")
+	})
+
+	b.Handle("/all_bonds", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		rows, err := db.Query("SELECT b.id, u.nickname, b.name, b.amount, b.can_withdraw FROM bonds b JOIN users u ON b.user_id = u.tg_id")
+		if err != nil { return c.Send("❌ Ошибка БД") }
+		defer rows.Close()
+		var res strings.Builder
+		res.WriteString("📈 **ВКЛАДЫ:**\n\n")
+		for rows.Next() {
+			var id int; var n, bn string; var am float64; var cw bool
+			rows.Scan(&id, &n, &bn, &am, &cw)
+			st := "🔒"; if cw { st = "🔓" }
+			res.WriteString(fmt.Sprintf("%d | %s | %s | %.2f | %s\n", id, n, bn, am, st))
+		}
+		return c.Send(res.String(), telebot.ModeMarkdown)
+	})
+
 	b.Handle("/cash_all", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		rows, err := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
-		if err != nil { return c.Send("Ошибка БД") }
+		rows, err := db.Query("SELECT u.nickname, COALESCE(b.amount, 0) FROM users u LEFT JOIN balances b ON b.user_id = u.tg_id")
+		if err != nil { return c.Send("❌ Ошибка БД") }
 		defer rows.Close()
 		var res strings.Builder
 		res.WriteString("💰 **БАЛАНСЫ:**\n\n")
@@ -203,12 +291,12 @@ func main() {
 
 	b.Handle("/cash_all_file", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
-		rows, _ := db.Query("SELECT user_id, amount FROM balances")
+		rows, _ := db.Query("SELECT u.tg_id, u.nickname, COALESCE(b.amount, 0) FROM users u LEFT JOIN balances b ON u.tg_id = b.user_id")
 		defer rows.Close()
-		txt := "ID | BALANCE\n"
+		txt := "ID | NICK | BALANCE\n"
 		for rows.Next() {
-			var id string; var a float64
-			rows.Scan(&id, &a); txt += fmt.Sprintf("%s | %.2f\n", id, a)
+			var id, ni string; var a float64
+			rows.Scan(&id, &ni, &a); txt += fmt.Sprintf("%s | %s | %.2f\n", id, ni, a)
 		}
 		os.WriteFile("balances.txt", []byte(txt), 0644)
 		defer os.Remove("balances.txt")
@@ -221,7 +309,7 @@ func main() {
 		if len(a) < 3 { return c.Send("⚠️ /add_user [ID] [NICK] [ROLE]") }
 		db.Exec("INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3) ON CONFLICT (tg_id) DO UPDATE SET nickname=$2, role=$3", a[0], a[1], a[2])
 		setBalance(a[0], 0)
-		return c.Send("✅ Готово.")
+		return c.Send("✅ Пользователь добавлен.")
 	})
 
 	b.Handle("/del_user", func(c telebot.Context) error {
@@ -234,45 +322,49 @@ func main() {
 	b.Handle("/deposit", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
 		a := c.Args()
-		if len(a) < 2 { return c.Send("ID SUMMA?") }
+		if len(a) < 2 { return c.Send("ID СУММА?") }
 		v, _ := strconv.ParseFloat(a[1], 64)
 		cur, _ := getBalance(a[0])
 		setBalance(a[0], cur+v)
-		return c.Send("✅")
+		return c.Send("✅ Пополнено.")
 	})
 
-	// /START (ИСПРАВЛЕНО)
+	// /START
 	b.Handle("/start", func(c telebot.Context) error {
 		uid := strconv.FormatInt(c.Sender().ID, 10)
 		var ni, ro string
 		db.QueryRow("SELECT nickname, role FROM users WHERE tg_id=$1", uid).Scan(&ni, &ro)
-
-		rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
+		rowsU, _ := db.Query("SELECT tg_id, nickname FROM users ORDER BY nickname")
 		var uL []UserShort
-		for rowsU != nil && rowsU.Next() {
-			var u UserShort; rowsU.Scan(&u.ID, &u.Nick); uL = append(uL, u)
+		if rowsU != nil {
+			defer rowsU.Close()
+			for rowsU.Next() {
+				var u UserShort; rowsU.Scan(&u.ID, &u.Nick); uL = append(uL, u)
+			}
 		}
 		uJ, _ := json.Marshal(uL)
-
-		qB := `SELECT id, name, amount, rate, created_at, can_withdraw FROM bonds WHERE user_id=$1`
-		rowsB, _ := db.Query(qB, uid)
+		rowsB, _ := db.Query(`SELECT id, name, amount, rate, created_at, can_withdraw FROM bonds WHERE user_id=$1`, uid)
 		var userBonds []Bond
-		for rowsB != nil && rowsB.Next() {
-			var bo Bond; var t time.Time
-			rowsB.Scan(&bo.ID, &bo.Name, &bo.Amount, &bo.Rate, &t, &bo.CanWithdraw)
-			bo.CurrentValue = calcBond(bo.Amount, bo.Rate, t)
-			bo.Date = t.Format("02.01.2006")
-			userBonds = append(userBonds, bo)
+		if rowsB != nil {
+			defer rowsB.Close()
+			for rowsB.Next() {
+				var bo Bond; var t time.Time
+				rowsB.Scan(&bo.ID, &bo.Name, &bo.Amount, &bo.Rate, &t, &bo.CanWithdraw)
+				bo.CurrentValue = calcBond(bo.Amount, bo.Rate, t)
+				bo.Date = t.Format("02.01.2006")
+				userBonds = append(userBonds, bo)
+			}
 		}
 		bJ, _ := json.Marshal(userBonds)
-
 		rowsM, _ := db.Query("SELECT id, name, price, rate, min_days FROM available_bonds")
 		var marketBonds []MarketBond
-		for rowsM != nil && rowsM.Next() {
-			var mb MarketBond; rowsM.Scan(&mb.ID, &mb.Name, &mb.Price, &mb.Rate, &mb.MinDays); marketBonds = append(marketBonds, mb)
+		if rowsM != nil {
+			defer rowsM.Close()
+			for rowsM.Next() {
+				var mb MarketBond; rowsM.Scan(&mb.ID, &mb.Name, &mb.Price, &mb.Rate, &mb.MinDays); marketBonds = append(marketBonds, mb)
+			}
 		}
 		mJ, _ := json.Marshal(marketBonds)
-
 		ba, _ := getBalance(uid)
 		var inf string; db.QueryRow("SELECT text FROM info_line WHERE id=1").Scan(&inf)
 
@@ -281,7 +373,6 @@ func main() {
 
 		menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
 		menu.Reply(menu.Row(menu.WebApp("🇸🇪 Кабинет", &telebot.WebApp{URL: fURL})))
-		
 		return c.Send("🇸🇪 Система активна.", menu)
 	})
 
@@ -290,49 +381,42 @@ func main() {
 		var d WebAppData
 		json.Unmarshal([]byte(c.Message().WebAppData.Data), &d)
 		uid := strconv.FormatInt(c.Sender().ID, 10)
-
 		switch d.Action {
 		case "buy_bond":
 			var mb MarketBond
 			db.QueryRow("SELECT name, price, rate FROM available_bonds WHERE id=$1", d.BondID).Scan(&mb.Name, &mb.Price, &mb.Rate)
-			uBal, _ := getBalance(uid)
-			if uBal < d.Amount { return c.Send("❌ Недостаточно GOLD.") }
-			setBalance(uid, uBal-d.Amount)
+			uB, _ := getBalance(uid)
+			if uB < d.Amount { return c.Send("❌ Мало GOLD.") }
+			setBalance(uid, uB-d.Amount)
 			db.Exec("INSERT INTO bonds (user_id, name, amount, rate, created_at) VALUES ($1, $2, $3, $4, NOW())", uid, mb.Name, d.Amount, mb.Rate)
 			return c.Send("✅ Куплено!")
-
 		case "sell_bond":
 			var am, rt float64; var t time.Time; var cw bool
 			db.QueryRow("SELECT amount, rate, created_at, can_withdraw FROM bonds WHERE id=$1", d.BondID).Scan(&am, &rt, &t, &cw)
 			if !cw { return c.Send("🔒 Заморожено.") }
 			val := calcBond(am, rt, t)
-			uB, _ := getBalance(uid)
-			setBalance(uid, uB+val)
+			uB, _ := getBalance(uid); setBalance(uid, uB+val)
 			db.Exec("DELETE FROM bonds WHERE id=$1", d.BondID)
 			return c.Send("💰 Продано.")
-
 		case "withdraw":
 			m := &telebot.ReplyMarkup{}
 			bA := m.Data("✅", "approve", fmt.Sprintf("approve:%s:%.2f", uid, d.Amount))
 			bR := m.Data("❌", "reject", fmt.Sprintf("reject:%s", uid))
 			m.Inline(m.Row(bA, bR))
 			b.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС: %s | %.2f", d.Nick, d.Amount), m)
-			return c.Send("✅ Ожидайте.")
-
+			return c.Send("✅ Запрос отправлен.")
 		case "register":
 			db.Exec("INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3)", uid, d.Nick, d.Role)
 			setBalance(uid, 0)
 			return c.Send("✅ Регистрация.")
-
 		case "transfer":
 			sB, _ := getBalance(uid)
 			if sB < d.Amount { return c.Send("❌") }
 			rB, _ := getBalance(d.TargetID)
-			setBalance(uid, sB-d.Amount)
-			setBalance(d.TargetID, rB+d.Amount)
+			setBalance(uid, sB-d.Amount); setBalance(d.TargetID, rB+d.Amount)
 			tID, _ := strconv.ParseInt(d.TargetID, 10, 64)
-			b.Send(&telebot.User{ID: tID}, fmt.Sprintf("💰 +%.2f от %s", d.Amount, d.Nick))
-			return c.Send("✅")
+			b.Send(&telebot.User{ID: tID}, fmt.Sprintf("💰 +%.2f GOLD от %s", d.Amount, d.Nick))
+			return c.Send("✅ Перевод выполнен.")
 		}
 		return nil
 	})
