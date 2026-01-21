@@ -58,7 +58,7 @@ func main() {
 	}
 	defer db.Close()
 
-	// --- ИНТЕГРИРОВАНО ИСПРАВЛЕНИЕ №1: НАДЕЖНАЯ ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ---
+	// --- ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ (ТВОИ ЛОГИ СОХРАНЕНЫ) ---
 	
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`); err != nil {
 		log.Fatal("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось создать таблицу users: ", err)
@@ -143,19 +143,25 @@ func main() {
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
 
-	// --- АДМИН КОМАНДЫ ---
+	// --- ВСЕ АДМИН КОМАНДЫ ВОССТАНОВЛЕНЫ ---
+
+	b.Handle("/create_bond", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID { return nil }
+		args := c.Args()
+		if len(args) < 3 { return c.Send("⚠️ Формат: /create_bond [Название] [Мин_Цена] [Процент]") }
+		name := args[0]
+		price, _ := strconv.ParseFloat(args[1], 64)
+		rate, _ := strconv.ParseFloat(args[2], 64)
+		_, err := db.Exec("INSERT INTO available_bonds (name, price, rate) VALUES ($1, $2, $3)", name, price, rate)
+		if err != nil { return c.Send("❌ Ошибка БД") }
+		return c.Send(fmt.Sprintf("✅ Облигация %s создана!", name))
+	})
 
 	b.Handle("/all_bonds", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID {
-			return nil
-		}
+		if c.Sender().ID != AdminID { return nil }
 		rows, err := db.Query("SELECT b.id, u.nickname, b.name, b.amount FROM bonds b JOIN users u ON b.user_id = u.tg_id")
-		if err != nil {
-			return c.Send("❌ Ошибка БД или данных нет.")
-		}
-		if rows == nil {
-			return c.Send("📈 Вкладов пока нет.")
-		}
+		if err != nil { return c.Send("❌ Ошибка БД или данных нет.") }
+		if rows == nil { return c.Send("📈 Вкладов пока нет.") }
 		defer rows.Close()
 
 		res := "📈 Все активные вклады:\n"
@@ -169,20 +175,14 @@ func main() {
 				count++
 			}
 		}
-		if count == 0 {
-			return c.Send("📈 Активных вкладов не обнаружено.")
-		}
+		if count == 0 { return c.Send("📈 Активных вкладов не обнаружено.") }
 		return c.Send(res)
 	})
 
 	b.Handle("/cash_all_file", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID {
-			return nil
-		}
+		if c.Sender().ID != AdminID { return nil }
 		rows, err := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
-		if err != nil || rows == nil {
-			return c.Send("❌ Нечего выгружать.")
-		}
+		if err != nil || rows == nil { return c.Send("❌ Нечего выгружать.") }
 		defer rows.Close()
 
 		content := "--- РЕЕСТР БАЛАНСОВ ---\n"
@@ -200,13 +200,9 @@ func main() {
 	})
 
 	b.Handle("/deposit", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID {
-			return nil
-		}
+		if c.Sender().ID != AdminID { return nil }
 		args := c.Args()
-		if len(args) < 2 {
-			return c.Send("⚠️ Формат: /deposit [ID] [Сумма]")
-		}
+		if len(args) < 2 { return c.Send("⚠️ Формат: /deposit [ID] [Сумма]") }
 		v, _ := strconv.ParseFloat(args[1], 64)
 		setBalance(args[0], getBalance(args[0])+v)
 		return c.Send(fmt.Sprintf("✅ Баланс %s пополнен на %.2f", args[0], v))
@@ -250,35 +246,25 @@ func main() {
 		return c.Send("🇸🇪 Добро пожаловать в финансовую систему Швеции.", menu)
 	})
 
+	// --- ОБРАБОТКА ДАННЫХ ИЗ WEBAPP (С МГНОВЕННЫМ ВХОДОМ И БАЛАНСОМ) ---
+
 	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
-		if c.Message().WebAppData == nil {
-			return nil
-		}
+		if c.Message().WebAppData == nil { return nil }
 		var d WebAppData
 		err := json.Unmarshal([]byte(c.Message().WebAppData.Data), &d)
-		if err != nil {
-			return nil
-		}
+		if err != nil { return nil }
 		uid := strconv.FormatInt(c.Sender().ID, 10)
 
 		switch d.Action {
 		case "register":
-			query := `
-				INSERT INTO users (tg_id, nickname, role) 
-				VALUES ($1, $2, $3) 
-				ON CONFLICT (tg_id) 
-				DO UPDATE SET nickname = EXCLUDED.nickname, role = EXCLUDED.role
-			`
+			query := `INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3) ON CONFLICT (tg_id) DO UPDATE SET nickname = $2, role = $3`
 			_, err := db.Exec(query, uid, d.Nick, d.Role)
+			if err != nil { return c.Send("❌ Ошибка регистрации") }
+			
+			// Инициализация баланса БЕЗ ОБНУЛЕНИЯ существующих денег
+			db.Exec("INSERT INTO balances (user_id, amount) VALUES ($1, 0) ON CONFLICT DO NOTHING", uid)
 
-			if err != nil {
-				log.Println("ОШИБКА SQL ПРИ РЕГИСТРАЦИИ:", err)
-				return c.Send("❌ Ошибка регистрации")
-			}
-			setBalance(uid, getBalance(uid)) 
-
-			// --- НОВЫЙ ФУНКЦИОНАЛ: МГНОВЕННЫЙ ВХОД ---
-			// Пересобираем данные для URL, так как пользователь теперь "существует"
+			// --- МГНОВЕННЫЙ ВХОД (ГЕНЕРАЦИЯ НОВОГО МЕНЮ) ---
 			uL := []UserShort{}
 			rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
 			if rowsU != nil {
@@ -303,22 +289,38 @@ func main() {
 			}
 			mJ, _ := json.Marshal(mL)
 
-			// Теперь exists=true, так как мы только что создали юзера
 			fURL := fmt.Sprintf("%s?tg_id=%s&exists=true&nick=%s&role=%s&bal=%.2f&users=%s&market=%s",
 				WebAppURL, uid, url.QueryEscape(d.Nick), url.QueryEscape(d.Role), getBalance(uid),
 				url.QueryEscape(string(uJ)), url.QueryEscape(string(mJ)))
 
 			menu := &telebot.ReplyMarkup{ResizeKeyboard: true}
 			menu.Reply(menu.Row(menu.WebApp("🇸🇪 Открыть банк", &telebot.WebApp{URL: fURL})))
+			return c.Send("✅ Регистрация завершена! Аккаунт активирован:", menu)
 
-			return c.Send("✅ Регистрация завершена! Ваш аккаунт активирован. Теперь вы можете войти в систему:", menu)
-			// --- КОНЕЦ НОВОГО ФУНКЦИОНАЛА ---
+		case "buy_bond":
+			var price, rate float64
+			var name string
+			err := db.QueryRow("SELECT name, price, rate FROM available_bonds WHERE id=$1", d.BondID).Scan(&name, &price, &rate)
+			if err != nil || getBalance(uid) < d.Amount || d.Amount < price {
+				return c.Send("❌ Ошибка покупки: проверьте баланс или сумму.")
+			}
+			setBalance(uid, getBalance(uid)-d.Amount)
+			db.Exec("INSERT INTO bonds (user_id, name, amount, rate) VALUES ($1, $2, $3, $4)", uid, name, d.Amount, rate)
+			return c.Send(fmt.Sprintf("✅ Вы инвестировали %.2f GOLD в %s", d.Amount, name))
+
+		case "sell_bond":
+			var am, ra float64
+			var ct time.Time
+			err := db.QueryRow("SELECT amount, rate, created_at FROM bonds WHERE id=$1 AND user_id=$2", d.BondID, uid).Scan(&am, &ra, &ct)
+			if err != nil { return c.Send("❌ Инвестиция не найдена.") }
+			val := calcBond(am, ra, ct)
+			setBalance(uid, getBalance(uid)+val)
+			db.Exec("DELETE FROM bonds WHERE id=$1", d.BondID)
+			return c.Send(fmt.Sprintf("💰 Вклад закрыт! Получено %.2f GOLD", val))
 
 		case "transfer":
 			cur := getBalance(uid)
-			if cur < d.Amount {
-				return c.Send("❌ Недостаточно средств")
-			}
+			if cur < d.Amount { return c.Send("❌ Недостаточно средств") }
 			setBalance(uid, cur-d.Amount)
 			setBalance(d.TargetID, getBalance(d.TargetID)+d.Amount)
 			return c.Send(fmt.Sprintf("💸 Перевод %.2f GOLD выполнен успешно!", d.Amount))
