@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -58,8 +59,7 @@ func main() {
 	}
 	defer db.Close()
 
-	// --- ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ (ТВОИ ЛОГИ СОХРАНЕНЫ) ---
-	
+	// ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (tg_id TEXT PRIMARY KEY, nickname TEXT, role TEXT)`); err != nil {
 		log.Fatal("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось создать таблицу users: ", err)
 	}
@@ -98,12 +98,14 @@ func main() {
 		return amount * math.Pow(1+(rate/100), days)
 	}
 
-	// HTTP API
+	// HTTP API ДЛЯ СИНХРОНИЗАЦИИ ДАННЫХ
 	go func() {
+		// Получение данных пользователя
 		http.HandleFunc("/api/get_user_data", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			uid := r.URL.Query().Get("uid")
 			if uid == "" {
+				http.Error(w, "Missing uid", http.StatusBadRequest)
 				return
 			}
 
@@ -131,10 +133,46 @@ func main() {
 				"bonds":   userBonds,
 			})
 		})
+
+		// Получение списка пользователей
+		http.HandleFunc("/api/get_users", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			
+			var uL []UserShort
+			rowsU, _ := db.Query("SELECT tg_id, nickname FROM users ORDER BY nickname")
+			if rowsU != nil {
+				defer rowsU.Close()
+				for rowsU.Next() {
+					var u UserShort
+					rowsU.Scan(&u.ID, &u.Nick)
+					uL = append(uL, u)
+				}
+			}
+			json.NewEncoder(w).Encode(uL)
+		})
+
+		// Получение списка облигаций
+		http.HandleFunc("/api/get_market", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			
+			var mL []MarketBond
+			rowsM, _ := db.Query("SELECT id, name, price, rate FROM available_bonds")
+			if rowsM != nil {
+				defer rowsM.Close()
+				for rowsM.Next() {
+					var m MarketBond
+					rowsM.Scan(&m.ID, &m.Name, &m.Price, &m.Rate)
+					mL = append(mL, m)
+				}
+			}
+			json.NewEncoder(w).Encode(mL)
+		})
+
 		port := os.Getenv("PORT")
 		if port == "" {
 			port = "8080"
 		}
+		log.Println("🌐 HTTP API запущен на порту:", port)
 		http.ListenAndServe(":"+port, nil)
 	}()
 
@@ -143,46 +181,142 @@ func main() {
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
 
-	// --- ВСЕ АДМИН КОМАНДЫ ВОССТАНОВЛЕНЫ ---
+	// ОБРАБОТЧИК CALLBACK КНОПОК (ВЫВОД СРЕДСТВ)
+	b.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		data := c.Callback().Data
 
+		if strings.HasPrefix(data, "approve:") {
+			parts := strings.Split(data, ":")
+			if len(parts) < 3 {
+				return c.Respond(&telebot.CallbackResponse{Text: "Ошибка данных"})
+			}
+
+			targetID := parts[1]
+			amount, _ := strconv.ParseFloat(parts[2], 64)
+
+			cur := getBalance(targetID)
+			if cur < amount {
+				c.Edit("❌ ОШИБКА: Недостаточно средств у игрока.")
+				return c.Respond(&telebot.CallbackResponse{Text: "Мало GOLD"})
+			}
+
+			setBalance(targetID, cur-amount)
+			tID, _ := strconv.ParseInt(targetID, 10, 64)
+			
+			// Уведомление пользователю
+			b.Send(&telebot.User{ID: tID}, fmt.Sprintf("✅ Вывод одобрен!\n💰 Сумма: %.2f GOLD списано с вашего баланса.", amount))
+
+			c.Edit(fmt.Sprintf("✅ ОДОБРЕНО\n👤 ID: %s\n💰 Сумма: %.2f GOLD", targetID, amount))
+			return c.Respond(&telebot.CallbackResponse{Text: "Выполнено"})
+		}
+
+		if strings.HasPrefix(data, "reject:") {
+			parts := strings.Split(data, ":")
+			if len(parts) < 2 {
+				return c.Respond(&telebot.CallbackResponse{Text: "Ошибка данных"})
+			}
+
+			targetID := parts[1]
+			tID, _ := strconv.ParseInt(targetID, 10, 64)
+			
+			// Уведомление пользователю
+			b.Send(&telebot.User{ID: tID}, "❌ Ваш запрос на вывод средств был отклонен администрацией.")
+
+			c.Edit("❌ ОТКЛОНЕНО")
+			return c.Respond(&telebot.CallbackResponse{Text: "Отклонено"})
+		}
+
+		return c.Respond()
+	})
+
+	// АДМИН КОМАНДЫ
 	b.Handle("/create_bond", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
+		if c.Sender().ID != AdminID {
+			return nil
+		}
 		args := c.Args()
-		if len(args) < 3 { return c.Send("⚠️ Формат: /create_bond [Название] [Мин_Цена] [Процент]") }
+		if len(args) < 3 {
+			return c.Send("⚠️ Формат: /create_bond [Название] [Мин_Цена] [Процент]")
+		}
 		name := args[0]
 		price, _ := strconv.ParseFloat(args[1], 64)
 		rate, _ := strconv.ParseFloat(args[2], 64)
 		_, err := db.Exec("INSERT INTO available_bonds (name, price, rate) VALUES ($1, $2, $3)", name, price, rate)
-		if err != nil { return c.Send("❌ Ошибка БД") }
+		if err != nil {
+			return c.Send("❌ Ошибка БД")
+		}
 		return c.Send(fmt.Sprintf("✅ Облигация %s создана!", name))
 	})
 
 	b.Handle("/all_bonds", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
-		rows, err := db.Query("SELECT b.id, u.nickname, b.name, b.amount FROM bonds b JOIN users u ON b.user_id = u.tg_id")
-		if err != nil { return c.Send("❌ Ошибка БД или данных нет.") }
-		if rows == nil { return c.Send("📈 Вкладов пока нет.") }
+		if c.Sender().ID != AdminID {
+			return nil
+		}
+		rows, err := db.Query("SELECT b.id, u.nickname, b.name, b.amount, b.rate, b.created_at, b.can_withdraw FROM bonds b JOIN users u ON b.user_id = u.tg_id ORDER BY b.id DESC")
+		if err != nil {
+			return c.Send("❌ Ошибка БД или данных нет.")
+		}
+		if rows == nil {
+			return c.Send("📈 Вкладов пока нет.")
+		}
 		defer rows.Close()
 
-		res := "📈 Все активные вклады:\n"
+		res := "📈 Все активные вклады:\n\n"
 		count := 0
 		for rows.Next() {
 			var id int
 			var nick, name string
-			var am float64
-			if err := rows.Scan(&id, &nick, &name, &am); err == nil {
-				res += fmt.Sprintf("[%d] %s: %s (%.2f)\n", id, nick, name, am)
+			var am, rt float64
+			var ct time.Time
+			var cw bool
+			if err := rows.Scan(&id, &nick, &name, &am, &rt, &ct, &cw); err == nil {
+				icon := "🔒"
+				if cw {
+					icon = "🔓"
+				}
+				cur := calcBond(am, rt, ct)
+				res += fmt.Sprintf("[%d] %s %s: %s\n💰 %.2f → %.2f GOLD\n📅 %s\n\n", id, icon, nick, name, am, cur, ct.Format("02.01 15:04"))
 				count++
 			}
 		}
-		if count == 0 { return c.Send("📈 Активных вкладов не обнаружено.") }
+		if count == 0 {
+			return c.Send("📈 Активных вкладов не обнаружено.")
+		}
 		return c.Send(res)
 	})
 
+	b.Handle("/set_lock", func(c telebot.Context) error {
+		if c.Sender().ID != AdminID {
+			return nil
+		}
+		args := c.Args()
+		if len(args) < 2 {
+			return c.Send("⚠️ /set_lock [ID] [1-разлок / 0-блок]")
+		}
+		val := args[1] == "1"
+		res, err := db.Exec("UPDATE bonds SET can_withdraw = $1 WHERE id = $2", val, args[0])
+		if err != nil {
+			return c.Send("❌ Ошибка базы: " + err.Error())
+		}
+		rows, _ := res.RowsAffected()
+		if rows == 0 {
+			return c.Send("❌ Ошибка: Инвестиция с таким ID не найдена.")
+		}
+		status := "заблокирована"
+		if val {
+			status = "разблокирована"
+		}
+		return c.Send(fmt.Sprintf("✅ Инвестиция #%s %s.", args[0], status))
+	})
+
 	b.Handle("/cash_all_file", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
+		if c.Sender().ID != AdminID {
+			return nil
+		}
 		rows, err := db.Query("SELECT u.nickname, b.amount FROM balances b JOIN users u ON b.user_id = u.tg_id")
-		if err != nil || rows == nil { return c.Send("❌ Нечего выгружать.") }
+		if err != nil || rows == nil {
+			return c.Send("❌ Нечего выгружать.")
+		}
 		defer rows.Close()
 
 		content := "--- РЕЕСТР БАЛАНСОВ ---\n"
@@ -200,9 +334,13 @@ func main() {
 	})
 
 	b.Handle("/deposit", func(c telebot.Context) error {
-		if c.Sender().ID != AdminID { return nil }
+		if c.Sender().ID != AdminID {
+			return nil
+		}
 		args := c.Args()
-		if len(args) < 2 { return c.Send("⚠️ Формат: /deposit [ID] [Сумма]") }
+		if len(args) < 2 {
+			return c.Send("⚠️ Формат: /deposit [ID] [Сумма]")
+		}
 		v, _ := strconv.ParseFloat(args[1], 64)
 		setBalance(args[0], getBalance(args[0])+v)
 		return c.Send(fmt.Sprintf("✅ Баланс %s пополнен на %.2f", args[0], v))
@@ -246,25 +384,30 @@ func main() {
 		return c.Send("🇸🇪 Добро пожаловать в финансовую систему Швеции.", menu)
 	})
 
-	// --- ОБРАБОТКА ДАННЫХ ИЗ WEBAPP (С МГНОВЕННЫМ ВХОДОМ И БАЛАНСОМ) ---
-
+	// ОБРАБОТКА ДАННЫХ ИЗ WEBAPP
 	b.Handle(telebot.OnWebApp, func(c telebot.Context) error {
-		if c.Message().WebAppData == nil { return nil }
+		if c.Message().WebAppData == nil {
+			return nil
+		}
 		var d WebAppData
 		err := json.Unmarshal([]byte(c.Message().WebAppData.Data), &d)
-		if err != nil { return nil }
+		if err != nil {
+			return nil
+		}
 		uid := strconv.FormatInt(c.Sender().ID, 10)
 
 		switch d.Action {
 		case "register":
 			query := `INSERT INTO users (tg_id, nickname, role) VALUES ($1, $2, $3) ON CONFLICT (tg_id) DO UPDATE SET nickname = $2, role = $3`
 			_, err := db.Exec(query, uid, d.Nick, d.Role)
-			if err != nil { return c.Send("❌ Ошибка регистрации") }
-			
+			if err != nil {
+				return c.Send("❌ Ошибка регистрации")
+			}
+
 			// Инициализация баланса БЕЗ ОБНУЛЕНИЯ существующих денег
 			db.Exec("INSERT INTO balances (user_id, amount) VALUES ($1, 0) ON CONFLICT DO NOTHING", uid)
 
-			// --- МГНОВЕННЫЙ ВХОД (ГЕНЕРАЦИЯ НОВОГО МЕНЮ) ---
+			// МГНОВЕННЫЙ ВХОД
 			uL := []UserShort{}
 			rowsU, _ := db.Query("SELECT tg_id, nickname FROM users")
 			if rowsU != nil {
@@ -311,8 +454,14 @@ func main() {
 		case "sell_bond":
 			var am, ra float64
 			var ct time.Time
-			err := db.QueryRow("SELECT amount, rate, created_at FROM bonds WHERE id=$1 AND user_id=$2", d.BondID, uid).Scan(&am, &ra, &ct)
-			if err != nil { return c.Send("❌ Инвестиция не найдена.") }
+			var cw bool
+			err := db.QueryRow("SELECT amount, rate, created_at, can_withdraw FROM bonds WHERE id=$1 AND user_id=$2", d.BondID, uid).Scan(&am, &ra, &ct, &cw)
+			if err != nil {
+				return c.Send("❌ Инвестиция не найдена.")
+			}
+			if !cw {
+				return c.Send("🔒 Эта инвестиция заморожена администрацией. Обратитесь к админу.")
+			}
 			val := calcBond(am, ra, ct)
 			setBalance(uid, getBalance(uid)+val)
 			db.Exec("DELETE FROM bonds WHERE id=$1", d.BondID)
@@ -320,14 +469,42 @@ func main() {
 
 		case "transfer":
 			cur := getBalance(uid)
-			if cur < d.Amount { return c.Send("❌ Недостаточно средств") }
+			if cur < d.Amount {
+				return c.Send("❌ Недостаточно средств для перевода")
+			}
+			
+			// Получаем никнейм отправителя
+			var senderNick string
+			db.QueryRow("SELECT nickname FROM users WHERE tg_id=$1", uid).Scan(&senderNick)
+			if senderNick == "" {
+				senderNick = d.Nick
+			}
+			
+			// Получаем никнейм получателя
+			var receiverNick string
+			db.QueryRow("SELECT nickname FROM users WHERE tg_id=$1", d.TargetID).Scan(&receiverNick)
+			
+			// Выполняем перевод
 			setBalance(uid, cur-d.Amount)
 			setBalance(d.TargetID, getBalance(d.TargetID)+d.Amount)
-			return c.Send(fmt.Sprintf("💸 Перевод %.2f GOLD выполнен успешно!", d.Amount))
+			
+			// Уведомление получателю
+			targetIDInt, err := strconv.ParseInt(d.TargetID, 10, 64)
+			if err == nil {
+				b.Send(&telebot.User{ID: targetIDInt}, fmt.Sprintf("💰 Вам поступил перевод!\n👤 От: %s\n💵 Сумма: %.2f GOLD", senderNick, d.Amount))
+			}
+			
+			// Уведомление отправителю
+			return c.Send(fmt.Sprintf("✅ Перевод выполнен успешно!\n👤 Получатель: %s\n💸 Сумма: %.2f GOLD", receiverNick, d.Amount))
 
 		case "withdraw":
-			b.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС НА ВЫВОД\nОт: %s\nСумма: %.2f GOLD\nID: %s", d.Nick, d.Amount, uid))
-			return c.Send("✅ Ваш запрос на вывод средств отправлен на проверку.")
+			markup := &telebot.ReplyMarkup{}
+			btnApprove := markup.Data("✅ Одобрить", "approve", fmt.Sprintf("approve:%s:%.2f", uid, d.Amount))
+			btnReject := markup.Data("❌ Отклонить", "reject", fmt.Sprintf("reject:%s", uid))
+			markup.Inline(markup.Row(btnApprove, btnReject))
+
+			b.Send(&telebot.User{ID: AdminID}, fmt.Sprintf("⚠️ ЗАПРОС НА ВЫВОД\n👤 От: %s (ID: %s)\n💰 Сумма: %.2f GOLD", d.Nick, uid, d.Amount), markup)
+			return c.Send("✅ Ваш запрос на вывод средств отправлен на проверку администратору.")
 		}
 		return nil
 	})
