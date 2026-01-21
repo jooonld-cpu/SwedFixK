@@ -55,9 +55,10 @@ type WebAppData struct {
 }
 
 func main() {
-	// ИСПРАВЛЕНИЕ ПОДКЛЮЧЕНИЯ: 
+	// ИСПРАВЛЕНИЕ ПОДКЛЮЧЕНИЯ:
 	// Мы проверяем наличие отдельных переменных для БД (хост, пароль и т.д.).
-	// Это самый надежный способ избежать ошибок со спецсимволами вроде [ ] + / в пароле.
+	// Это самый надежный способ избежать ошибок со спецсимволами вроде [ ] + / в пароле
+	// и принудительно использовать IPv4 через redwood.dev для обхода ошибки network unreachable.
 	var db *sql.DB
 	var err error
 
@@ -77,6 +78,7 @@ func main() {
 				host := u.Host
 				user := u.User.Username()
 				dbname := strings.TrimPrefix(u.Path, "/")
+				// Пересобираем в безопасный DSN формат
 				dsn := fmt.Sprintf("host=%s user=%s password='%s' dbname=%s sslmode=require", 
 					host, user, pass, dbname)
 				db, err = sql.Open("postgres", dsn)
@@ -92,9 +94,9 @@ func main() {
 	}
 	defer db.Close()
 
-	// Проверка соединения
+	// Проверка соединения с БД
 	if err := db.Ping(); err != nil {
-		log.Println("❌ БД недоступна (проверьте пароль):", err)
+		log.Println("❌ БД недоступна (проверьте параметры):", err)
 	}
 
 	// 1. ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ
@@ -219,7 +221,6 @@ func main() {
 	b.Handle("/set_info", func(c telebot.Context) error {
 		if c.Sender().ID != AdminID { return nil }
 		
-		// Исправлено: Сначала пробуем Payload, если пусто — берем все аргументы через Join
 		txt := strings.TrimSpace(c.Message().Payload)
 		if txt == "" {
 			if len(c.Args()) > 0 {
