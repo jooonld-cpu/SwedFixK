@@ -203,9 +203,16 @@ func main() {
 
 	// ОБРАБОТЧИК CALLBACK КНОПОК - ИСПРАВЛЕНО!
 	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
-		// Получаем данные после разделителя |
 		data := c.Callback().Data
 		log.Println("📥 Получен callback:", data)
+
+		// Убираем префикс до | если он есть
+		if strings.Contains(data, "|") {
+			parts := strings.Split(data, "|")
+			if len(parts) > 1 {
+				data = parts[1]
+			}
+		}
 
 		// ПОДТВЕРЖДЕНИЕ ВЫВОДА СРЕДСТВ
 		if strings.HasPrefix(data, "approve:") {
