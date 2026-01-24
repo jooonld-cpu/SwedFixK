@@ -88,7 +88,6 @@ func main() {
 		log.Fatal("❌ Ошибка создания complaints:", err)
 	}
 
-	// Добавление колонки banned если её нет
 	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE`)
 
 	getBalance := func(uid string) float64 {
@@ -119,7 +118,7 @@ func main() {
 		return amount * math.Pow(1+(rate/100), days)
 	}
 
-	// HTTP API ДЛЯ СИНХРОНИЗАЦИИ ДАННЫХ
+	// HTTP API
 	go func() {
 		http.HandleFunc("/api/get_user_data", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -147,7 +146,6 @@ func main() {
 				}
 			}
 
-			// Проверка последней жалобы
 			var lastComplaint time.Time
 			db.QueryRow("SELECT COALESCE(MAX(created_at), '1970-01-01') FROM complaints WHERE user_id=$1", uid).Scan(&lastComplaint)
 			canComplain := time.Since(lastComplaint).Hours() >= 12
@@ -162,7 +160,6 @@ func main() {
 
 		http.HandleFunc("/api/get_users", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-
 			var uL []UserShort
 			rowsU, _ := db.Query("SELECT tg_id, nickname FROM users WHERE banned = false ORDER BY nickname")
 			if rowsU != nil {
@@ -178,7 +175,6 @@ func main() {
 
 		http.HandleFunc("/api/get_market", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-
 			var mL []MarketBond
 			rowsM, _ := db.Query("SELECT id, name, price, rate FROM available_bonds")
 			if rowsM != nil {
@@ -205,8 +201,9 @@ func main() {
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
 
-	// ОБРАБОТЧИК CALLBACK КНОПОК
+	// ОБРАБОТЧИК CALLBACK КНОПОК - ИСПРАВЛЕНО!
 	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		// Получаем данные после разделителя |
 		data := c.Callback().Data
 		log.Println("📥 Получен callback:", data)
 
@@ -268,7 +265,7 @@ func main() {
 
 			cur := getBalance(targetID)
 			setBalance(targetID, cur+amount)
-			
+
 			tID, _ := strconv.ParseInt(targetID, 10, 64)
 			bot.Send(&telebot.User{ID: tID}, fmt.Sprintf("✅ Пополнение подтверждено!\n💰 Сумма: %.2f GOLD зачислено на ваш баланс.", amount))
 
