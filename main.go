@@ -195,27 +195,45 @@ func main() {
 		// ── КАЗИНО API ──────────────────────────────────────────────────
 		http.HandleFunc("/api/casino", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Content-Type", "application/json")
 
-			if r.Method != http.MethodPost {
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			// Браузер сначала шлёт OPTIONS preflight — отвечаем 200
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
 				return
 			}
 
-			var d WebAppData
-			if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-				http.Error(w, "Bad request", http.StatusBadRequest)
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				json.NewEncoder(w).Encode(map[string]interface{}{"error": "method not allowed"})
 				return
 			}
 
 			uid := r.URL.Query().Get("uid")
 			if uid == "" {
-				http.Error(w, "Missing uid", http.StatusBadRequest)
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{"error": "missing uid"})
 				return
 			}
 
+			var d WebAppData
+			if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{"error": "bad request"})
+				return
+			}
+
+			log.Printf("🎰 Casino: uid=%s game=%s bet=%.2f win=%v payout=%.2f", uid, d.Game, d.Bet, d.Win, d.Payout)
+
 			if isBanned(uid) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"error": "banned"})
+				return
+			}
+
+			if d.Bet <= 0 {
+				json.NewEncoder(w).Encode(map[string]interface{}{"error": "invalid bet"})
 				return
 			}
 
@@ -225,6 +243,7 @@ func main() {
 				return
 			}
 
+			log.Printf("✅ Casino done: uid=%s newBal=%.2f", uid, newBal)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"ok":      true,
 				"balance": newBal,
