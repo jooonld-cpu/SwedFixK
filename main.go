@@ -56,6 +56,7 @@ type WebAppData struct {
 var bot *telebot.Bot
 
 func main() {
+	StartKeepAlive()
 	dsn := os.Getenv("DATABASE_URL")
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
