@@ -61,6 +61,8 @@ type WebAppData struct {
 var bot *telebot.Bot
 
 func main() {
+	StartKeepAlive()
+
 	dsn := os.Getenv("DATABASE_URL")
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -119,6 +121,12 @@ func main() {
 
 	// HTTP API
 	go func() {
+		// Главная страница — для Render health check
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "Бот активен!")
+		})
+
 		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
@@ -257,14 +265,6 @@ func main() {
 		}
 		log.Println("🌐 HTTP API запущен на порту:", port)
 		http.ListenAndServe(":"+port, nil)
-	}()
-
-	// Самопинг чтобы Render не засыпал
-	go func() {
-		for {
-			time.Sleep(10 * time.Minute)
-			http.Get("https://swedfixk.onrender.com/health")
-		}
 	}()
 
 	bot, _ = telebot.NewBot(telebot.Settings{
